@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runTaskAwareCompaction } from "../src/compaction.js";
@@ -35,6 +35,35 @@ const taskLine = (task: IndexedTask): string => {
   const details = [baseDetails, task.expansionCount ? `expanded ${task.expansionCount}×` : ""].filter(Boolean).join(", ");
   return `${task.status.padEnd(9)} ${task.taskId}  ${task.objective}${details ? ` — ${details}` : ""}`;
 };
+
+const compactText = (value: string, maxChars = 160): string => {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
+};
+
+const summaryField = (label: string, value: string, theme: Theme): string =>
+  `${theme.fg("accent", label)}\n${theme.fg("toolOutput", value || "(none)")}`;
+
+const summaryList = (label: string, values: string[], theme: Theme): string => {
+  const body = values.length
+    ? values.map((value) => `• ${value.replace(/\n/g, "\n  ")}`).join("\n")
+    : "(none)";
+  return `${theme.fg("accent", label)}\n${theme.fg(values.length ? "toolOutput" : "dim", body)}`;
+};
+
+const expandedTaskSummary = (details: EndMarker, theme: Theme): string => [
+  theme.fg("success", `✓ task ${details.taskId} closed`),
+  summaryField("Objective", details.objective, theme),
+  summaryField("Outcome", details.outcome, theme),
+  summaryList("Attempted", details.attempted, theme),
+  summaryList("Learnings", details.learnings, theme),
+  summaryList("Decisions", details.decisions, theme),
+  summaryList("Files read", details.filesRead, theme),
+  summaryList("Files modified", details.filesModified, theme),
+  summaryList("Artifacts", details.artifacts, theme),
+  summaryList("Verification", details.verification, theme),
+  summaryList("Open threads", details.openThreads, theme),
+].join("\n\n");
 
 export default function taskCompaction(pi: ExtensionAPI) {
   let index: TaskIndex = { tasks: new Map(), ordered: [], open: undefined };
@@ -78,12 +107,20 @@ export default function taskCompaction(pi: ExtensionAPI) {
   pi.registerTool({
     name: BEGIN_TOOL,
     label: "Begin Task",
-    description: "Open one bounded, tool-heavy investigation or experiment whose details can later be replaced by a durable summary. Returns the task ID required by end_task.",
+    description: "Open one bounded, tool-heavy phase of work whose details can later be replaced by a durable summary. Returns the task ID required by end_task.",
     promptSnippet: "Open a bounded task region before substantial disposable exploration",
     promptGuidelines: [
-      "Use begin_task only for bounded work expected to produce several tool calls or roughly 4k–8k+ disposable tokens; do not use it for a single read, command, or tiny edit.",
-      "Call begin_task alone in its assistant message, then complete the bounded work without waiting for user input.",
-      "After begin_task, call end_task as soon as the bounded work is complete and before returning to user-facing discussion.",
+      "Use begin_task for one bounded, tool-heavy phase of work whose detailed transcript can later be discarded.",
+      "A single user request or project may contain multiple sequential task regions. Do not treat the entire request as one task merely because it has one overall objective.",
+      "Scope each region around one durable milestone, such as codebase exploration and an implementation plan, one coherent implementation slice, diagnosis of a specific failure, one experiment or benchmark, or final integration and verification.",
+      "Treat roughly 4k–8k disposable tokens as a target region size, not only as a minimum for using begin_task. If a phase is likely to grow substantially beyond that, divide it at the next coherent milestone.",
+      "Close the current region before changing work phases—for example, when moving from exploration to implementation, implementation to debugging, or debugging to final verification. Do not keep a region open solely because the overall user request is unfinished.",
+      "Prefer multiple meaningful sequential regions over one project-wide region. Do not fragment closely related edits and checks into tiny regions.",
+      "Do not use begin_task for a single read, command, tiny edit, or user-facing discussion.",
+      "Call begin_task alone in its assistant message, then perform that phase without waiting for user input.",
+      "Call end_task alone as soon as the phase reaches its milestone. Make its summary sufficient to continue after the detailed transcript is removed.",
+      "After end_task completes, if another substantial phase remains, open a new task with begin_task alone and continue without waiting for the user. If only small follow-up work remains, complete it without opening another region.",
+      "User-facing discussion should occur only after the current task region has been closed.",
     ],
     executionMode: "sequential",
     parameters: Type.Object({
@@ -185,9 +222,15 @@ export default function taskCompaction(pi: ExtensionAPI) {
     renderCall(args, theme) {
       return new Text(`${theme.fg("toolTitle", theme.bold(END_TOOL))} ${theme.fg("muted", args.task_id)}`, 0, 0);
     },
-    renderResult(result, _options, theme) {
+    renderResult(result, { expanded }, theme) {
       const details = result.details as EndMarker | undefined;
-      return new Text(details ? theme.fg("success", `✓ task ${details.taskId} closed`) : theme.fg("error", "Task was not closed"), 0, 0);
+      if (!details) return new Text(theme.fg("error", "Task was not closed"), 0, 0);
+      if (expanded) return new Text(expandedTaskSummary(details, theme), 0, 0);
+
+      const outcome = compactText(details.outcome) || "no outcome supplied";
+      const text = `${theme.fg("success", `✓ task ${details.taskId} closed`)} ${theme.fg("muted", `— ${outcome}`)}` +
+        ` (${keyHint("app.tools.expand", "to view summary")})`;
+      return new Text(text, 0, 0);
     },
   });
 
