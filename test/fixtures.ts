@@ -52,6 +52,7 @@ export const endMarker = (taskId = "task1", beginCallId = `begin-${taskId}`, end
   endToolCallId: endCallId,
   objective: `Explore ${taskId}`,
   outcome: "Found the answer",
+  executionContext: "repo /tmp/project; branch main; cwd /tmp/project; clean worktree",
   attempted: ["Read the implementation"],
   learnings: ["The durable fact"],
   decisions: ["Use the safe path"],

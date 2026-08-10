@@ -15,9 +15,25 @@ describe("transformMessages", () => {
     const result = transformMessages(input);
     expect(result.messages).toHaveLength(3);
     expect(result.messages[1]?.role).toBe("custom");
-    expect((result.messages[1] as { content: string }).content).toContain("<task-summary id=\"task1\">");
+    const summary = (result.messages[1] as { content: string }).content;
+    expect(summary).toContain("<task-summary id=\"task1\">");
+    expect(summary).toContain("Execution context: repo /tmp/project; branch main; cwd /tmp/project; clean worktree");
+    expect(summary).toContain("Do not acknowledge or respond to them directly");
+    expect(summary).toContain("Continue the most recent unresolved user request");
     expect(accepted(input)?.rawChars).toBeGreaterThan(8000);
     expect(() => convertToLlm(result.messages)).not.toThrow();
+  });
+
+  it("continues to accept summaries created before execution context was added", () => {
+    const input = closedTaskMessages();
+    const endResult = input[5];
+    if (endResult?.role === "toolResult") {
+      delete (endResult.details as { executionContext?: string }).executionContext;
+    }
+
+    const result = transformMessages(input);
+    expect(accepted(input)).toBeTruthy();
+    expect((result.messages[0] as { content: string }).content).toContain("Execution context: Not recorded");
   });
 
   it("compacts two sequential tasks newest-to-oldest without index drift", () => {

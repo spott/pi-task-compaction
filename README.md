@@ -38,13 +38,14 @@ After editing an installed local package, run `/reload` in pi.
 
 ### `begin_task`
 
-Opens one bounded task and returns its task ID. Use it only when exploration is expected to produce several tool calls or roughly 4k–8k+ disposable tokens. The call must be alone in its assistant message.
+Opens one bounded work phase and returns its task ID. Treat roughly 4k–8k disposable tokens as a target region size and use multiple sequential regions for larger requests, closing at durable milestones or phase changes. Do not fragment single reads, commands, or tiny edits. The call must be alone in its assistant message.
 
 ### `end_task`
 
 Closes the current task. It requires the matching ID and a complete typed summary:
 
 - objective and outcome
+- execution context: repository or worktree, branch, working directory, and dirty state
 - approaches attempted
 - durable learnings and decisions
 - files read and modified
@@ -52,7 +53,9 @@ Closes the current task. It requires the matching ID and a complete typed summar
 - verification and outcomes
 - unresolved threads and next steps
 
-All arrays are required but may be empty. The call must be alone in its assistant message.
+All arrays are required but may be empty. Each summary should remain self-sufficient while avoiding unchanged detail from the immediately preceding retained summary. Critical execution state, modified files, verification state, open threads, and exact failed experiments must remain explicit. The call must be alone in its assistant message.
+
+Injected `<task-summary>` messages are internal context restoration rather than new requests. The prompt directs the model not to acknowledge them: it should continue the unresolved request, or report completion when that work is finished.
 
 ### `expand_task`
 

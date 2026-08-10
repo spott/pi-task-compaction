@@ -43,6 +43,7 @@ export function parseEndMarker(details: unknown, toolName?: string): EndMarker |
     details.endToolCallId,
   ];
   if (!strings.every((item) => typeof item === "string")) return undefined;
+  if (details.executionContext !== undefined && typeof details.executionContext !== "string") return undefined;
   const arrays = [
     details.attempted,
     details.learnings,

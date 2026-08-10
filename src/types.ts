@@ -21,6 +21,7 @@ export interface BeginMarker {
 export interface TaskSummary {
   objective: string;
   outcome: string;
+  executionContext?: string | undefined;
   attempted: string[];
   learnings: string[];
   decisions: string[];

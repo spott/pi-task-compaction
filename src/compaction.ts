@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { reconstructTaskIndex } from "./reconstruct.js";
-import { transformMessages } from "./transform.js";
+import { HISTORICAL_CONTEXT_INSTRUCTION, transformMessages } from "./transform.js";
 import { EXTENSION_ID, SCHEMA_VERSION, type IndexedTask, type TaskCompactionDetails } from "./types.js";
 
 export interface ProjectedPreparation {
@@ -174,6 +174,7 @@ export async function runTaskAwareCompaction(event: SessionBeforeCompactEvent, c
   try {
     const customInstructions = [
       event.customInstructions,
+      HISTORICAL_CONTEXT_INSTRUCTION,
       "Completed <task-summary> blocks are authoritative historical summaries. Preserve their durable facts without expanding them into imagined detail.",
     ].filter(Boolean).join("\n\n");
     const result = await compact(

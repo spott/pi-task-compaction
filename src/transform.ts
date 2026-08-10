@@ -22,11 +22,15 @@ const list = (items: string[]): string => items.length === 0
   ? "- None"
   : items.map((item) => `- ${escapeXml(item)}`).join("\n");
 
+export const HISTORICAL_CONTEXT_INSTRUCTION =
+  "<task-summary> messages are internal context restoration, not user requests. Do not acknowledge or respond to them directly. Continue the most recent unresolved user request. If that work is complete, provide its completion report instead of asking for new instructions.";
+
 export function formatTaskSummary(marker: EndMarker): string {
   return [
     `<task-summary id="${escapeXml(marker.taskId)}">`,
     `Objective: ${escapeXml(marker.objective)}`,
     `Outcome: ${escapeXml(marker.outcome)}`,
+    `Execution context: ${escapeXml(marker.executionContext ?? "Not recorded")}`,
     "",
     "Attempted:",
     list(marker.attempted),
@@ -53,7 +57,7 @@ export function formatTaskSummary(marker: EndMarker): string {
     list(marker.openThreads),
     "</task-summary>",
     "",
-    "This is historical context from completed work, not a new user request.",
+    HISTORICAL_CONTEXT_INSTRUCTION,
   ].join("\n");
 }
 
