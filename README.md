@@ -20,16 +20,23 @@ Pi's built-in manual, threshold, and overflow compaction is intercepted when tas
 
 ## Install
 
-During development:
+From a local checkout:
 
 ```bash
-pi install /home/spott/code/pi-task-compaction
+pi install "$PWD"
 ```
 
 Or run it for one invocation:
 
 ```bash
-pi -e /home/spott/code/pi-task-compaction
+pi -e "$PWD"
+```
+
+With Nix, build the tested package and load the resulting directory directly:
+
+```bash
+nix build
+pi -e ./result
 ```
 
 After editing an installed local package, run `/reload` in pi.
@@ -86,6 +93,17 @@ Requires Node.js 22.19+.
 npm install
 npm run check
 ```
+
+Alternatively, the flake provides Node.js, `nixfmt`, and the npm dependency hash tool:
+
+```bash
+nix develop
+npm install
+npm run check
+```
+
+Run all flake checks with `nix flake check`. The flake also exposes the
+`pi-task-compaction` package, a default formatter, and an overlay.
 
 The tests cover whole-region protocol validation, sequential regions, open/corrupt/future markers, user interruptions, sibling boundary calls, branch reconstruction, bounded recovery, provider/model changes, and task-aware global-compaction boundary alignment.
 
