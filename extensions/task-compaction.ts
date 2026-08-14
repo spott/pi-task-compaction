@@ -1,9 +1,17 @@
 import { randomUUID } from "node:crypto";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { runTaskAwareCompaction } from "../src/compaction.js";
-import { expandTaskTranscript } from "../src/expand.js";
+import {
+  formatEntryResult,
+  formatTranscriptResult,
+  listTaskTranscript,
+  locateTranscriptEntry,
+  materializeTaskTranscript,
+  searchTaskTranscript,
+} from "../src/expand.js";
 import { getToolCalls } from "../src/markers.js";
 import {
   createPreservedOutputRecord,
@@ -37,6 +45,36 @@ import {
 } from "../src/types.js";
 
 const makeTaskId = (): string => randomUUID().split("-")[0]!;
+
+const expandTaskParameters = Type.Object({
+  task_id: Type.String({ description: "Task ID shown by /tasks or a task summary" }),
+  view: StringEnum(["transcript", "list", "search", "entry"] as const, { description: "Transcript descriptor, bounded entry list, literal search, or exact entry locator" }),
+  query: Type.Optional(Type.String({ minLength: 1, description: "Case-insensitive literal query; required for an initial search" })),
+  context_entries: Type.Optional(Type.Integer({ minimum: 0, maximum: 10, description: "Entries around each search match; defaults to 1" })),
+  entry_id: Type.Optional(Type.String({ description: "Session entry ID; required only for entry view" })),
+  cursor: Type.Optional(Type.String({ description: "Opaque continuation cursor; valid only for list and search views" })),
+  direction: Type.Optional(StringEnum(["forward", "backward"] as const, { description: "List or search direction; defaults to forward" })),
+  max_chars: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 50_000, description: "Maximum inline list or search characters; defaults to 30,000" })),
+}, { additionalProperties: false });
+
+type ExpandTaskParams = Static<typeof expandTaskParameters>;
+
+const prepareExpandTaskArguments = (args: unknown): ExpandTaskParams => {
+  if (typeof args === "object" && args !== null && !Array.isArray(args)) {
+    const fields = Object.keys(args);
+    const removed = ["include_entry_ids", "include_tool_output", "tool_names"].filter((field) => fields.includes(field));
+    if (removed.length) {
+      throw new Error(
+        `expand_task no longer returns an inline transcript; removed field${removed.length === 1 ? "" : "s"}: ${removed.join(", ")}. ` +
+        "Choose view: transcript, list, search, or entry.",
+      );
+    }
+    if (!("view" in args)) {
+      throw new Error("expand_task now requires view: transcript, list, search, or entry");
+    }
+  }
+  return args as ExpandTaskParams;
+};
 
 const formatRatio = (task: IndexedTask): string => {
   if (!task.rawChars || !task.summaryChars) return "n/a";
@@ -426,45 +464,121 @@ export default function taskCompaction(pi: ExtensionAPI) {
   pi.registerTool({
     name: EXPAND_TOOL,
     label: "Expand Task",
-    description: "Recover a bounded plain-text serialization of a task's original transcript from the current session branch. Output is capped and tool results are already serialization-truncated.",
-    promptSnippet: "Recover details from a previously compacted task region",
-    parameters: Type.Object({
-      task_id: Type.String({ description: "Task ID shown by /tasks or a task summary" }),
-      max_chars: Type.Optional(Type.Integer({ minimum: 1000, maximum: 50000, description: "Hard output budget; default 30000" })),
-      include_entry_ids: Type.Optional(Type.Boolean({ description: "Include session entry IDs for diagnostics" })),
-      include_tool_output: Type.Optional(Type.Boolean({ description: "Include serialized tool output; default true" })),
-      tool_names: Type.Optional(Type.Array(Type.String(), { description: "If set, include tool results only for these tool names" })),
-    }),
+    description: "Materialize a completed task as a branch-validated private JSONL transcript, list compact entry metadata, search complete persisted text, or locate one exact entry in that artifact.",
+    promptSnippet: "Locate or inspect persisted entries from a previously compacted task",
+    promptGuidelines: [
+      "Use expand_task with view: list or view: search to locate relevant entries, then view: entry to obtain an exact JSONL locator.",
+      "Use view: transcript when normal file tools such as read, rg, grep, jq, head, or tail are more efficient than bounded inline navigation.",
+      "Generated transcript files contain complete persisted task data and may contain sensitive arguments or results. Treat them as ephemeral private caches and do not copy them into the repository.",
+    ],
+    parameters: expandTaskParameters,
+    prepareArguments: prepareExpandTaskArguments,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       refresh(ctx);
       const task = index.tasks.get(params.task_id);
       if (!task) throw new Error(`Unknown task ID: ${params.task_id}`);
-      const expanded = expandTaskTranscript(ctx.sessionManager.getBranch(), task, {
-        maxChars: params.max_chars ?? 30000,
-        includeEntryIds: params.include_entry_ids ?? false,
-        includeToolOutput: params.include_tool_output ?? true,
-        toolNames: params.tool_names,
-        sessionFile: ctx.sessionManager.getSessionFile(),
+      if (params.view !== "entry" && params.entry_id !== undefined) {
+        throw new Error("entry_id is valid only for expand_task view: entry");
+      }
+      if (params.view === "entry" && !params.entry_id) {
+        throw new Error("entry_id is required for expand_task view: entry");
+      }
+      if (params.view !== "search" && (params.query !== undefined || params.context_entries !== undefined)) {
+        throw new Error("query and context_entries are valid only for expand_task view: search");
+      }
+      if (params.view === "search" && params.cursor !== undefined && params.query !== undefined) {
+        throw new Error("cursor is mutually exclusive with query for expand_task view: search");
+      }
+      if (params.view === "search" && params.cursor === undefined && params.query === undefined) {
+        throw new Error("query is required for expand_task view: search");
+      }
+      if (params.view !== "list" && params.view !== "search" &&
+        (params.cursor !== undefined || params.direction !== undefined || params.max_chars !== undefined)) {
+        throw new Error("cursor, direction, and max_chars are valid only for expand_task views: list and search");
+      }
+
+      const transcript = await materializeTaskTranscript(ctx.sessionManager.getBranch(), task, {
+        sessionId: ctx.sessionManager.getSessionId(),
       });
-      const details: ExpansionDetails = {
-        extension: EXTENSION_ID,
-        schemaVersion: SCHEMA_VERSION,
-        event: "expand",
-        taskId: task.taskId,
-        truncated: expanded.truncated,
-        returnedChars: expanded.returnedChars,
-      };
-      return { content: [{ type: "text", text: expanded.text }], details };
+      let details: ExpansionDetails;
+      let text: string;
+      if (params.view === "entry") {
+        const locator = locateTranscriptEntry(transcript, params.entry_id!);
+        details = {
+          extension: EXTENSION_ID,
+          schemaVersion: SCHEMA_VERSION,
+          event: "expand",
+          taskId: task.taskId,
+          view: "entry",
+          artifact: transcript.descriptor,
+          locator,
+        };
+        text = formatEntryResult(locator);
+      } else if (params.view === "list") {
+        const page = listTaskTranscript(task.taskId, transcript, {
+          cursor: params.cursor,
+          direction: params.direction,
+          maxChars: params.max_chars,
+        });
+        details = {
+          extension: EXTENSION_ID,
+          schemaVersion: SCHEMA_VERSION,
+          event: "expand",
+          taskId: task.taskId,
+          view: "list",
+          artifact: transcript.descriptor,
+          ...page.details,
+        };
+        text = page.text;
+      } else if (params.view === "search") {
+        const page = searchTaskTranscript(task.taskId, transcript, {
+          query: params.query,
+          contextEntries: params.context_entries,
+          cursor: params.cursor,
+          direction: params.direction,
+          maxChars: params.max_chars,
+        });
+        details = {
+          extension: EXTENSION_ID,
+          schemaVersion: SCHEMA_VERSION,
+          event: "expand",
+          taskId: task.taskId,
+          view: "search",
+          artifact: transcript.descriptor,
+          ...page.details,
+        };
+        text = page.text;
+      } else {
+        details = {
+          extension: EXTENSION_ID,
+          schemaVersion: SCHEMA_VERSION,
+          event: "expand",
+          taskId: task.taskId,
+          view: "transcript",
+          artifact: transcript.descriptor,
+        };
+        text = formatTranscriptResult(task.taskId, transcript.descriptor);
+      }
+      return { content: [{ type: "text", text }], details };
     },
     renderCall(args, theme) {
-      return new Text(`${theme.fg("toolTitle", theme.bold(EXPAND_TOOL))} ${theme.fg("muted", args.task_id)}`, 0, 0);
+      return new Text(`${theme.fg("toolTitle", theme.bold(EXPAND_TOOL))} ${theme.fg("muted", `${args.task_id} ${args.view}`)}`, 0, 0);
     },
     renderResult(result, _options, theme) {
       const details = result.details as ExpansionDetails | undefined;
       const text = details
-        ? `Expanded ${details.taskId}: ${details.returnedChars.toLocaleString()} chars${details.truncated ? " (truncated)" : ""}`
+        ? details.view === "entry"
+          ? `Located ${details.locator.entryId} at line ${details.locator.line.toLocaleString("en-US")}`
+          : details.view === "list"
+            ? `Listed ${details.returnedRecords.toLocaleString("en-US")}/${details.totalRecords.toLocaleString("en-US")} entries for ${details.taskId}`
+            : details.view === "search"
+              ? `Found ${details.totalMatches.toLocaleString("en-US")} matches; showing ${details.returnedRecords.toLocaleString("en-US")}/${details.totalRecords.toLocaleString("en-US")} windows for ${details.taskId}`
+              : `Materialized ${details.taskId}: ${details.artifact.entries.toLocaleString("en-US")} entries`
         : "Task expansion failed";
-      return new Text(theme.fg(details?.truncated ? "warning" : "success", text), 0, 0);
+      const color = details && (details.view === "list" || details.view === "search") && details.truncated
+        ? "warning"
+        : details ? "success" : "error";
+      return new Text(theme.fg(color, text), 0, 0);
     },
   });
 

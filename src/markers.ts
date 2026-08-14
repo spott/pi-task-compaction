@@ -103,8 +103,49 @@ export function parseCancelMarker(data: unknown): CancelMarker | undefined {
 export function parseExpansionDetails(details: unknown, toolName?: string): ExpansionDetails | undefined {
   if (toolName !== undefined && toolName !== EXPAND_TOOL) return undefined;
   if (!isRecord(details) || !hasEnvelope(details, "expand")) return undefined;
-  if (typeof details.taskId !== "string" || typeof details.truncated !== "boolean" || typeof details.returnedChars !== "number") {
-    return undefined;
+  if (typeof details.taskId !== "string" ||
+    (details.view !== "transcript" && details.view !== "list" &&
+      details.view !== "search" && details.view !== "entry")) return undefined;
+  if (!isRecord(details.artifact)) return undefined;
+  const artifact = details.artifact;
+  if (
+    typeof artifact.path !== "string" ||
+    artifact.format !== "pi-session-entry-jsonl" ||
+    typeof artifact.entries !== "number" || !Number.isSafeInteger(artifact.entries) || artifact.entries < 1 ||
+    typeof artifact.bytes !== "number" || !Number.isSafeInteger(artifact.bytes) || artifact.bytes < 1 ||
+    typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(artifact.sha256) ||
+    typeof artifact.beginEntryId !== "string" ||
+    typeof artifact.endEntryId !== "string"
+  ) return undefined;
+  if (details.view === "entry") {
+    if (!isRecord(details.locator)) return undefined;
+    const locator = details.locator;
+    if (
+      locator.path !== artifact.path ||
+      locator.format !== "pi-session-entry-jsonl" ||
+      typeof locator.entryId !== "string" ||
+      typeof locator.line !== "number" || !Number.isSafeInteger(locator.line) || locator.line < 1 ||
+      typeof locator.entryBytes !== "number" || !Number.isSafeInteger(locator.entryBytes) || locator.entryBytes < 1 ||
+      locator.artifactSha256 !== artifact.sha256
+    ) return undefined;
+  } else if (details.view === "list" || details.view === "search") {
+    if (
+      typeof details.truncated !== "boolean" ||
+      (details.truncationReason !== undefined && details.truncationReason !== "max_chars") ||
+      typeof details.returnedChars !== "number" || !Number.isSafeInteger(details.returnedChars) || details.returnedChars < 0 ||
+      typeof details.returnedRecords !== "number" || !Number.isSafeInteger(details.returnedRecords) || details.returnedRecords < 0 ||
+      typeof details.totalRecords !== "number" || !Number.isSafeInteger(details.totalRecords) || details.totalRecords < 0 ||
+      details.returnedRecords > details.totalRecords ||
+      (details.nextCursor !== undefined && typeof details.nextCursor !== "string") ||
+      (details.previousCursor !== undefined && typeof details.previousCursor !== "string") ||
+      (details.truncated && details.truncationReason !== "max_chars") ||
+      (!details.truncated && details.truncationReason !== undefined)
+    ) return undefined;
+    if (details.view === "list" &&
+      (details.returnedRecords < 1 || details.totalRecords !== artifact.entries)) return undefined;
+    if (details.view === "search" &&
+      (typeof details.totalMatches !== "number" || !Number.isSafeInteger(details.totalMatches) ||
+        details.totalMatches < 0 || details.totalMatches < details.totalRecords)) return undefined;
   }
   return details as unknown as ExpansionDetails;
 }

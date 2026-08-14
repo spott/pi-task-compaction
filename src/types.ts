@@ -114,14 +114,70 @@ export interface CancelMarker {
   reason?: string | undefined;
 }
 
-export interface ExpansionDetails {
+export type ExpansionView = "transcript" | "list" | "search" | "entry";
+
+export interface TranscriptArtifact {
+  path: string;
+  format: "pi-session-entry-jsonl";
+  entries: number;
+  bytes: number;
+  sha256: string;
+  beginEntryId: string;
+  endEntryId: string;
+}
+
+export interface EntryLocator {
+  path: string;
+  format: "pi-session-entry-jsonl";
+  entryId: string;
+  line: number;
+  entryBytes: number;
+  artifactSha256: string;
+}
+
+export interface ExpansionDetailsBase {
   extension: typeof EXTENSION_ID;
   schemaVersion: typeof SCHEMA_VERSION;
   event: "expand";
   taskId: string;
-  truncated: boolean;
-  returnedChars: number;
+  view: ExpansionView;
+  artifact: TranscriptArtifact;
 }
+
+export interface TranscriptExpansionDetails extends ExpansionDetailsBase {
+  view: "transcript";
+}
+
+export interface EntryExpansionDetails extends ExpansionDetailsBase {
+  view: "entry";
+  locator: EntryLocator;
+}
+
+export interface BoundedExpansionDetails extends ExpansionDetailsBase {
+  view: "list" | "search";
+  truncated: boolean;
+  truncationReason?: "max_chars" | undefined;
+  returnedChars: number;
+  returnedRecords: number;
+  totalRecords: number;
+  nextCursor?: string | undefined;
+  previousCursor?: string | undefined;
+}
+
+export interface ListExpansionDetails extends BoundedExpansionDetails {
+  view: "list";
+}
+
+export interface SearchExpansionDetails extends BoundedExpansionDetails {
+  view: "search";
+  totalMatches: number;
+}
+
+export type ExpansionDetails =
+  | TranscriptExpansionDetails
+  | EntryExpansionDetails
+  | ListExpansionDetails
+  | SearchExpansionDetails;
 
 export type Marker = BeginMarker | EndMarker;
 

@@ -66,7 +66,18 @@ Injected `<task-summary>` messages are internal context restoration rather than 
 
 ### `expand_task`
 
-Returns a bounded plain-text serialization of the original task transcript. It supports a hard character budget, optional entry IDs, tool-output omission, and filtering tool results by tool name. Truncated output identifies the complete session file.
+Recovers the complete persisted transcript of a closed task without injecting that transcript into every later model request. Every call is validated against the active branch and requires one view:
+
+- `transcript` materializes the exact inclusive task range as one UTF-8 JSONL file and returns its path, entry/byte counts, boundary IDs, and SHA-256 hash.
+- `list` returns bounded compact entry metadata—line numbers, entry IDs, roles, tool/call IDs, sizes, errors, and recognized source truncation—without dumping complete arguments or bodies.
+- `search` performs case-insensitive literal search over complete decoded persisted text, including assistant text/thinking, tool names and arguments, tool results, and custom messages. It returns bounded excerpts with optional surrounding entries.
+- `entry` resolves one branch-local entry ID to its exact one-based line in the JSONL artifact; it does not inline the entry body.
+
+`list` and `search` accept `max_chars` (1,000–50,000), direction, and opaque continuation cursors. An initial search requires `query`; cursor continuations recover the original query and reject conflicting request state. Use normal file tools such as `read`, `rg`, `grep`, `jq`, `head`, or `tail` when direct artifact inspection is more efficient.
+
+Artifacts contain complete data Pi persisted, including potentially sensitive arguments and results. They are ephemeral caches under a session-specific private temporary directory, not project files: directories use mode `0700`, files use `0600`, writes are atomic, and cached bytes/provenance are verified before reuse. The artifact cannot restore bytes already omitted by the original producing tool, and a new call never exposes a task that is absent from the active branch. Do not copy generated transcript artifacts into the repository.
+
+The former inline-only fields (`include_entry_ids`, `include_tool_output`, and `tool_names`) were removed. Calls must choose `transcript`, `list`, `search`, or `entry` explicitly.
 
 ### `preserve_output`
 
@@ -123,7 +134,7 @@ npm run check
 Run all flake checks with `nix flake check`. The flake also exposes the
 `pi-task-compaction` package, a default formatter, and an overlay.
 
-The tests cover whole-region protocol validation, sequential regions, open/corrupt/future markers, user interruptions, sibling boundary calls, branch reconstruction, bounded recovery, provider/model changes, task-aware global-compaction boundary alignment, preserved-output provenance and hashing, delayed selection, summary injection, branch behavior, and integrity-checked reads.
+The tests cover whole-region protocol validation, sequential regions, open/corrupt/future markers, user interruptions, sibling boundary calls, branch reconstruction, private transcript artifacts, entry locators, bounded list/search cursors, full persisted-text search, provider/model changes, task-aware global-compaction boundary alignment, preserved-output provenance and hashing, delayed selection, summary injection, branch behavior, and integrity-checked reads.
 
 ## Compatibility
 
