@@ -2,7 +2,16 @@
 
 A provider-agnostic [pi](https://pi.dev) extension for explicit, agent-driven compaction of bounded, tool-heavy tasks.
 
-The agent opens a region with `begin_task`, performs an investigation or experiment, and closes it with a typed `end_task` summary. On later model requests, the extension replaces the complete validated region with one historical `<task-summary>` block. The original session JSONL and TUI transcript are never rewritten.
+The agent opens a region with `begin_task`, performs an investigation or experiment, and closes it with a typed `end_task` summary. In the projection-enabled main branch, later model requests replace the complete validated region with one historical `<task-summary>` block. The original session JSONL and TUI transcript are never rewritten.
+
+## Experimental projection-disabled branch
+
+> [!WARNING]
+> This branch is an experimental shadow control, not the preferred product mode.
+
+It exposes the same six task tools, model-facing descriptions and workflow guidance, marker protocol, summaries, commands, and reconstruction behavior as main, but it does **not** register Pi's `context` or `session_before_compact` hooks.
+
+Completed task regions therefore remain verbatim in normal provider context, and Pi's default global compaction remains active rather than being replaced by task-aware compaction. Compression sizes shown by `/tasks` are hypothetical diagnostics computed during validation; they do not indicate that projection occurred. The `end_task` result still tells the model that a validated region will be replaced, intentionally blinding the model to the experimental arm. Select this branch only as the projection-disabled ablation control.
 
 ## Safety model
 
@@ -16,7 +25,7 @@ A region is pruned only when the extension can prove that:
 
 Ambiguous or invalid regions stay in full. State is reconstructed from tool-result details on the active session branch, so resume, fork, reload, and `/tree` navigation are branch-aware.
 
-Pi's built-in manual, threshold, and overflow compaction is intercepted when task state exists. Completed regions are projected as summaries before global summarization. If pi proposes a kept boundary inside a valid task, it is moved backward to the task's begin assistant entry so recovery remains possible. Provider prompt-cache payloads are not modified.
+In the projection-enabled main branch, Pi's built-in manual, threshold, and overflow compaction is intercepted when task state exists. Completed regions are projected as summaries before global summarization. If pi proposes a kept boundary inside a valid task, it is moved backward to the task's begin assistant entry so recovery remains possible. This experimental branch leaves those built-in compaction paths untouched. Provider prompt-cache payloads are not modified.
 
 ## Install
 

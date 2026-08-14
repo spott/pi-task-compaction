@@ -22,6 +22,7 @@ import {
   resolveTaskPreservations,
   type PreservedOutputIndex,
 } from "../src/preserved.js";
+import { TASK_PROJECTION_ENABLED } from "../src/projection-mode.js";
 import { reconstructTaskIndex } from "../src/reconstruct.js";
 import { transformMessages } from "../src/transform.js";
 import {
@@ -156,11 +157,13 @@ export default function taskCompaction(pi: ExtensionAPI) {
   pi.on("session_tree", (_event, ctx) => refresh(ctx));
   pi.on("session_compact", (_event, ctx) => refresh(ctx));
 
-  pi.on("context", (event, ctx) => {
-    refresh(ctx);
-    const result = transformMessages(event.messages);
-    return { messages: result.messages };
-  });
+  if (TASK_PROJECTION_ENABLED) {
+    pi.on("context", (event, ctx) => {
+      refresh(ctx);
+      const result = transformMessages(event.messages);
+      return { messages: result.messages };
+    });
+  }
 
   pi.on("input", (event, ctx) => {
     if (event.source !== "extension" && index.open && ctx.hasUI) {
@@ -172,7 +175,9 @@ export default function taskCompaction(pi: ExtensionAPI) {
     return { action: "continue" };
   });
 
-  pi.on("session_before_compact", async (event, ctx) => runTaskAwareCompaction(event, ctx));
+  if (TASK_PROJECTION_ENABLED) {
+    pi.on("session_before_compact", async (event, ctx) => runTaskAwareCompaction(event, ctx));
+  }
 
   pi.registerTool({
     name: BEGIN_TOOL,
