@@ -3,11 +3,14 @@ import {
   END_TOOL,
   EXPAND_TOOL,
   EXTENSION_ID,
+  PRESERVE_OUTPUT_TOOL,
   SCHEMA_VERSION,
   type BeginMarker,
   type CancelMarker,
   type EndMarker,
   type ExpansionDetails,
+  type PreservedOutputRecord,
+  type PreserveOutputMarker,
 } from "./types.js";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -30,6 +33,34 @@ export function parseBeginMarker(details: unknown, toolName?: string): BeginMark
   if (details.expectedScope !== undefined && typeof details.expectedScope !== "string") return undefined;
   if (details.assistantEntryId !== undefined && typeof details.assistantEntryId !== "string") return undefined;
   return details as unknown as BeginMarker;
+}
+
+export function parsePreservedOutputRecord(value: unknown): PreservedOutputRecord | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    typeof value.preservationId !== "string" || !/^po_[A-Za-z0-9_-]+$/.test(value.preservationId) ||
+    typeof value.label !== "string" || value.label.length === 0 ||
+    typeof value.sourceEntryId !== "string" || value.sourceEntryId.length === 0 ||
+    typeof value.sourceToolCallId !== "string" || value.sourceToolCallId.length === 0 ||
+    typeof value.sourceToolName !== "string" || value.sourceToolName.length === 0 ||
+    typeof value.sourceIsError !== "boolean" ||
+    typeof value.sourceChars !== "number" || !Number.isSafeInteger(value.sourceChars) || value.sourceChars < 0 ||
+    typeof value.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sourceSha256) ||
+    (value.selectedBy !== "preserve_output" && value.selectedBy !== "end_task")
+  ) return undefined;
+  if (value.reason !== undefined && typeof value.reason !== "string") return undefined;
+  if (value.sourceTaskId !== undefined && typeof value.sourceTaskId !== "string") return undefined;
+  if (value.sourceReportedTruncation !== undefined && typeof value.sourceReportedTruncation !== "boolean") {
+    return undefined;
+  }
+  return value as unknown as PreservedOutputRecord;
+}
+
+export function parsePreserveOutputMarker(details: unknown, toolName?: string): PreserveOutputMarker | undefined {
+  if (toolName !== undefined && toolName !== PRESERVE_OUTPUT_TOOL) return undefined;
+  if (!isRecord(details) || !hasEnvelope(details, "preserve-output")) return undefined;
+  if (!parsePreservedOutputRecord(details)) return undefined;
+  return details as unknown as PreserveOutputMarker;
 }
 
 export function parseEndMarker(details: unknown, toolName?: string): EndMarker | undefined {
@@ -56,6 +87,10 @@ export function parseEndMarker(details: unknown, toolName?: string): EndMarker |
   ];
   if (!arrays.every(hasStringArray)) return undefined;
   if (details.assistantEntryId !== undefined && typeof details.assistantEntryId !== "string") return undefined;
+  if (
+    details.preservedOutputs !== undefined &&
+    (!Array.isArray(details.preservedOutputs) || !details.preservedOutputs.every((item) => parsePreservedOutputRecord(item)))
+  ) return undefined;
   return details as unknown as EndMarker;
 }
 

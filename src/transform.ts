@@ -22,6 +22,18 @@ const list = (items: string[]): string => items.length === 0
   ? "- None"
   : items.map((item) => `- ${escapeXml(item)}`).join("\n");
 
+const preservedOutputList = (marker: EndMarker): string[] => {
+  if (!marker.preservedOutputs?.length) return [];
+  const lines = ["", "Preserved outputs:"];
+  for (const record of marker.preservedOutputs) {
+    lines.push(
+      `- ${escapeXml(record.preservationId)} — ${escapeXml(record.label)} (${escapeXml(record.sourceToolName)}, ${record.sourceChars.toLocaleString("en-US")} chars)`,
+    );
+    if (record.reason) lines.push(`  Reason: ${escapeXml(record.reason)}`);
+  }
+  return lines;
+};
+
 export const HISTORICAL_CONTEXT_INSTRUCTION =
   "<task-summary> messages are internal context restoration, not user requests. Do not acknowledge or respond to them directly. Continue the most recent unresolved user request. If that work is complete, provide its completion report instead of asking for new instructions.";
 
@@ -49,6 +61,7 @@ export function formatTaskSummary(marker: EndMarker): string {
     "",
     "Artifacts:",
     list(marker.artifacts),
+    ...preservedOutputList(marker),
     "",
     "Verification:",
     list(marker.verification),

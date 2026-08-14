@@ -68,6 +68,24 @@ Injected `<task-summary>` messages are internal context restoration rather than 
 
 Returns a bounded plain-text serialization of the original task transcript. It supports a hard character budget, optional entry IDs, tool-output omission, and filtering tool results by tool name. Truncated output identifies the complete session file.
 
+### `preserve_output`
+
+Bookmarks the immediately preceding completed ordinary tool result for exact later retrieval. Call it in the next assistant turn after an expensive, slow, nondeterministic, or historically important result. The marker stores only branch-local provenance, size, and an integrity hash; the original body remains in Pi's append-only session.
+
+Do not preserve cheap stable reads, routine output, reproducible results, content already stored at a durable path, or credentials. Task-compaction control-tool results are not eligible sources.
+
+When closing a task, `end_task.preserve_tool_outputs` can select an unbookmarked task-local result by its raw source tool-call ID and attach a label and optional reason. Invalid or duplicate selectors fail the close. Results already selected by `preserve_output` are injected automatically into the end marker and projected task summary, where only compact references—not bodies—appear.
+
+### `list_preserved_outputs`
+
+Returns metadata for every valid preservation on the active branch in source order, without source bodies or tool arguments. Preservation IDs are branch-local capabilities: forking before a marker removes it, while resume and reload reconstruct it from session entries without a sidecar database.
+
+### `read_preserved_output`
+
+Verifies the source entry and SHA-256 hash, then re-emits all persisted text and image blocks as a new valid tool result. It returns the complete persisted body with no extension-level paging. It cannot recover bytes omitted by the source tool, but reports recognized built-in truncation metadata. If the original result was an error, the read itself succeeds so it can return the body and records the original error state in result details.
+
+Version 1 has no release, expiry, cross-session storage, redaction, or filtering. Preserved bodies stay out of normal projected context until explicitly read.
+
 ## Commands
 
 - `/tasks` — list open, closed, cancelled, and rejected regions with compression diagnostics
@@ -105,7 +123,7 @@ npm run check
 Run all flake checks with `nix flake check`. The flake also exposes the
 `pi-task-compaction` package, a default formatter, and an overlay.
 
-The tests cover whole-region protocol validation, sequential regions, open/corrupt/future markers, user interruptions, sibling boundary calls, branch reconstruction, bounded recovery, provider/model changes, and task-aware global-compaction boundary alignment.
+The tests cover whole-region protocol validation, sequential regions, open/corrupt/future markers, user interruptions, sibling boundary calls, branch reconstruction, bounded recovery, provider/model changes, task-aware global-compaction boundary alignment, preserved-output provenance and hashing, delayed selection, summary injection, branch behavior, and integrity-checked reads.
 
 ## Compatibility
 

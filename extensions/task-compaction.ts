@@ -4,6 +4,16 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { runTaskAwareCompaction } from "../src/compaction.js";
 import { expandTaskTranscript } from "../src/expand.js";
+import { getToolCalls } from "../src/markers.js";
+import {
+  createPreservedOutputRecord,
+  listPreservedOutputs,
+  readPreservedOutput,
+  reconstructPreservedOutputs,
+  resolvePrecedingToolResult,
+  resolveTaskPreservations,
+  type PreservedOutputIndex,
+} from "../src/preserved.js";
 import { reconstructTaskIndex } from "../src/reconstruct.js";
 import { transformMessages } from "../src/transform.js";
 import {
@@ -12,12 +22,17 @@ import {
   END_TOOL,
   EXPAND_TOOL,
   EXTENSION_ID,
+  LIST_PRESERVED_OUTPUTS_TOOL,
+  PRESERVE_OUTPUT_TOOL,
+  READ_PRESERVED_OUTPUT_TOOL,
   SCHEMA_VERSION,
   type BeginMarker,
   type CancelMarker,
   type EndMarker,
   type ExpansionDetails,
   type IndexedTask,
+  type PreserveOutputMarker,
+  type PreservedOutputReadDetails,
   type TaskIndex,
 } from "../src/types.js";
 
@@ -51,6 +66,11 @@ const summaryList = (label: string, values: string[], theme: Theme): string => {
   return `${theme.fg("accent", label)}\n${theme.fg(values.length ? "toolOutput" : "dim", body)}`;
 };
 
+const preservedOutputLines = (details: EndMarker): string[] => (details.preservedOutputs ?? []).map((record) =>
+  `${record.preservationId} — ${record.label} (${record.sourceToolName}, ${record.sourceChars.toLocaleString("en-US")} chars)` +
+  (record.reason ? `\n  Reason: ${record.reason}` : "")
+);
+
 const expandedTaskSummary = (details: EndMarker, theme: Theme): string => [
   theme.fg("success", `✓ task ${details.taskId} closed`),
   summaryField("Objective", details.objective, theme),
@@ -62,12 +82,21 @@ const expandedTaskSummary = (details: EndMarker, theme: Theme): string => [
   summaryList("Files read", details.filesRead, theme),
   summaryList("Files modified", details.filesModified, theme),
   summaryList("Artifacts", details.artifacts, theme),
+  ...(details.preservedOutputs?.length
+    ? [summaryList("Preserved outputs", preservedOutputLines(details), theme)]
+    : []),
   summaryList("Verification", details.verification, theme),
   summaryList("Open threads", details.openThreads, theme),
 ].join("\n\n");
 
 export default function taskCompaction(pi: ExtensionAPI) {
   let index: TaskIndex = { tasks: new Map(), ordered: [], open: undefined };
+  let preservedIndex: PreservedOutputIndex = {
+    records: [],
+    byId: new Map(),
+    sources: new Map(),
+    diagnostics: [],
+  };
 
   const updateStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
@@ -79,7 +108,9 @@ export default function taskCompaction(pi: ExtensionAPI) {
   };
 
   const refresh = (ctx: ExtensionContext) => {
-    index = reconstructTaskIndex(ctx.sessionManager.getBranch());
+    const branch = ctx.sessionManager.getBranch();
+    index = reconstructTaskIndex(branch);
+    preservedIndex = reconstructPreservedOutputs(branch);
     updateStatus(ctx);
   };
 
@@ -163,6 +194,117 @@ export default function taskCompaction(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: PRESERVE_OUTPUT_TOOL,
+    label: "Preserve Output",
+    description: "Bookmark the immediately preceding completed ordinary tool result on the active branch without copying its body. Returns a stable preservation ID.",
+    promptSnippet: "Bookmark an expensive or nondeterministic prior tool result for exact later retrieval",
+    promptGuidelines: [
+      "Use preserve_output only when the exact result is likely to be needed after task compaction and rerunning it would be expensive, slow, nondeterministic, or would lose important prior state.",
+      "Call preserve_output in the next assistant turn after the source result, without unrelated or parallel tool calls between them.",
+      "Do not use preserve_output for cheap stable file reads, routine low-information output, reproducible output, durable artifacts, or credentials.",
+    ],
+    executionMode: "sequential",
+    parameters: Type.Object({
+      label: Type.String({ minLength: 1, description: "Short human-readable label for the preserved result" }),
+      reason: Type.Optional(Type.String({ description: "Why exact later retrieval is valuable" })),
+    }),
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+      refresh(ctx);
+      const branch = ctx.sessionManager.getBranch();
+      const resolution = resolvePrecedingToolResult(branch, toolCallId);
+      if (!resolution.ok) throw new Error(resolution.reason);
+      const sourceTaskId = index.open?.beginEntryIndex !== undefined &&
+        resolution.source.callEntryIndex >= index.open.beginEntryIndex &&
+        resolution.source.entryIndex >= index.open.beginEntryIndex
+        ? index.open.taskId
+        : undefined;
+      const record = createPreservedOutputRecord(resolution.source, {
+        label: params.label,
+        reason: params.reason,
+        sourceTaskId,
+        selectedBy: "preserve_output",
+      });
+      const marker: PreserveOutputMarker = {
+        extension: EXTENSION_ID,
+        schemaVersion: SCHEMA_VERSION,
+        event: "preserve-output",
+        ...record,
+      };
+      return {
+        content: [{ type: "text", text: `Preserved ${record.preservationId}: ${record.label}` }],
+        details: marker,
+      };
+    },
+    renderCall(args, theme) {
+      return new Text(`${theme.fg("toolTitle", theme.bold(PRESERVE_OUTPUT_TOOL))} ${theme.fg("muted", args.label)}`, 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as PreserveOutputMarker | undefined;
+      return new Text(
+        details
+          ? theme.fg("success", `Preserved ${details.preservationId}: ${details.label}`)
+          : theme.fg("error", "Output was not preserved"),
+        0,
+        0,
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: LIST_PRESERVED_OUTPUTS_TOOL,
+    label: "List Preserved Outputs",
+    description: "List compact metadata for valid preserved outputs on the active branch. Does not return source bodies or tool arguments.",
+    promptSnippet: "List branch-local preserved-output references without reading their bodies",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      refresh(ctx);
+      const outputs = listPreservedOutputs(ctx.sessionManager.getBranch());
+      return {
+        content: [{
+          type: "text",
+          text: outputs.length ? JSON.stringify(outputs, null, 2) : "No preserved outputs on the active branch.",
+        }],
+        details: { outputs },
+      };
+    },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold(LIST_PRESERVED_OUTPUTS_TOOL)), 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as { outputs?: unknown[] } | undefined;
+      const count = details?.outputs?.length ?? 0;
+      return new Text(theme.fg("success", `${count} preserved output${count === 1 ? "" : "s"}`), 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: READ_PRESERVED_OUTPUT_TOOL,
+    label: "Read Preserved Output",
+    description: "Verify and re-emit the complete persisted body of one preserved output from the active branch under a new valid tool result.",
+    promptSnippet: "Retrieve the exact persisted body for a preservation ID",
+    parameters: Type.Object({
+      preservation_id: Type.String({ minLength: 1, description: "Preservation ID shown by list_preserved_outputs or a task summary" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      refresh(ctx);
+      const result = readPreservedOutput(ctx.sessionManager.getBranch(), params.preservation_id);
+      if (!result.ok) throw new Error(result.error);
+      return { content: result.content, details: result.details };
+    },
+    renderCall(args, theme) {
+      return new Text(`${theme.fg("toolTitle", theme.bold(READ_PRESERVED_OUTPUT_TOOL))} ${theme.fg("muted", args.preservation_id)}`, 0, 0);
+    },
+    renderResult(result, _options, theme) {
+      const details = result.details as PreservedOutputReadDetails | undefined;
+      const text = details
+        ? `Read ${details.preservationId}: ${details.sourceChars.toLocaleString("en-US")} source chars` +
+          (details.sourceReportedTruncation ? " (source reported truncation)" : "")
+        : "Preserved output read failed";
+      return new Text(theme.fg(details ? "success" : "error", text), 0, 0);
+    },
+  });
+
+  pi.registerTool({
     name: END_TOOL,
     label: "End Task",
     description: "Close the open task with a typed, durable summary. Every array is required and may be empty. Include exact paths, symbols, checks, outcomes, and unresolved next steps needed after detailed tool output is pruned.",
@@ -174,6 +316,8 @@ export default function taskCompaction(pi: ExtensionAPI) {
       "For lengthy inherited background only, an unchanged-from task reference is acceptable when that task summary is guaranteed to remain available.",
       "Preserve exact failed commands or experiments together with their conclusions when that prevents later phases from retrying dead ends.",
       "Make end_task learnings, decisions, file paths, verification results, artifacts, and open threads complete enough to continue after the region transcript is removed.",
+      "Use end_task preserve_tool_outputs only for unbookmarked results inside the open task, identified by raw source tool-call ID; do not pass preservation IDs.",
+      "Do not copy preservation IDs or metadata into end_task summary arrays; region-local preserve_output records are injected automatically.",
     ],
     executionMode: "sequential",
     parameters: Type.Object({
@@ -189,6 +333,11 @@ export default function taskCompaction(pi: ExtensionAPI) {
       artifacts: Type.Array(Type.String(), { description: "Surviving scripts, logs, reports, fixtures, and other artifacts" }),
       verification: Type.Array(Type.String(), { description: "Commands, tests, and checks with outcomes" }),
       open_threads: Type.Array(Type.String(), { description: "Unresolved ideas and concrete next steps" }),
+      preserve_tool_outputs: Type.Optional(Type.Array(Type.Object({
+        source_tool_call_id: Type.String({ minLength: 1, description: "Raw tool-call ID of a completed result inside this task" }),
+        label: Type.String({ minLength: 1, description: "Short human-readable label for the preserved result" }),
+        reason: Type.Optional(Type.String({ description: "Why exact later retrieval is valuable" })),
+      }), { description: "Unbookmarked task-local results to preserve when closing" })),
     }),
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       refresh(ctx);
@@ -198,6 +347,31 @@ export default function taskCompaction(pi: ExtensionAPI) {
       }
       const begin = index.open.begin;
       if (!begin) throw new Error(`Open task ${params.task_id} has no valid begin marker`);
+      if (index.open.beginEntryIndex === undefined) {
+        throw new Error(`Open task ${params.task_id} has no valid begin assistant entry`);
+      }
+      const branch = ctx.sessionManager.getBranch();
+      const endAssistantIndexes = branch.flatMap((entry, entryIndex) =>
+        entry.type === "message" && entry.message.role === "assistant" &&
+          getToolCalls(entry.message).some((call) => call.id === toolCallId && call.name === END_TOOL)
+          ? [entryIndex]
+          : []
+      );
+      if (endAssistantIndexes.length !== 1) {
+        throw new Error(`end_task call ${toolCallId} is missing or ambiguous on the active branch`);
+      }
+      const preservation = resolveTaskPreservations(branch, {
+        taskId: params.task_id,
+        minEntryIndex: index.open.beginEntryIndex,
+        maxEntryIndex: endAssistantIndexes[0]!,
+        selectors: (params.preserve_tool_outputs ?? []).map((selector) => ({
+          sourceToolCallId: selector.source_tool_call_id,
+          label: selector.label,
+          reason: selector.reason,
+        })),
+      });
+      if (!preservation.ok) throw new Error(preservation.error);
+
       const marker: EndMarker = {
         extension: EXTENSION_ID,
         schemaVersion: SCHEMA_VERSION,
@@ -218,12 +392,19 @@ export default function taskCompaction(pi: ExtensionAPI) {
         verification: params.verification,
         openThreads: params.open_threads,
       };
+      if (preservation.records.length) marker.preservedOutputs = preservation.records;
       index.open.end = marker;
       index.open.status = "closed";
       index.open = undefined;
       updateStatus(ctx);
+      const preservedText = preservation.records.length
+        ? `\n\nPreserved outputs:\n${preservedOutputLines(marker).map((line) => `- ${line}`).join("\n")}`
+        : "";
       return {
-        content: [{ type: "text", text: `Closed task ${params.task_id}. Its validated region will be replaced by the structured task summary on subsequent model requests.` }],
+        content: [{
+          type: "text",
+          text: `Closed task ${params.task_id}. Its validated region will be replaced by the structured task summary on subsequent model requests.${preservedText}`,
+        }],
         details: marker,
       };
     },
@@ -291,8 +472,15 @@ export default function taskCompaction(pi: ExtensionAPI) {
     description: "List task-compaction regions and diagnostics",
     handler: async (_args, ctx) => {
       refresh(ctx);
-      const text = index.ordered.length ? index.ordered.map(taskLine).join("\n") : "No task regions on this branch.";
-      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      const taskText = index.ordered.length
+        ? index.ordered.map(taskLine).join("\n")
+        : "No task regions on this branch.";
+      const preservationText = preservedIndex.diagnostics.length
+        ? `\n\nPreservation diagnostics:\n${preservedIndex.diagnostics.map((diagnostic) =>
+          `invalid ${diagnostic.preservationId ?? "unknown ID"} at ${diagnostic.creationEntryId} — ${diagnostic.reason}`
+        ).join("\n")}`
+        : "";
+      if (ctx.hasUI) ctx.ui.notify(taskText + preservationText, "info");
     },
   });
 
