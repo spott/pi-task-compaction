@@ -9,6 +9,9 @@ import { Type } from "typebox";
 import type { Config } from "./config.js";
 import { LocalTaskInspector } from "./inspect/inspect.js";
 import type { TaskSummary } from "./model/summary.js";
+import type { RunRegistry } from "./store/run-registry.js";
+import type { WorkerBootstrap } from "./workers/bootstrap.js";
+import { WorkerTaskRouter } from "./workers/coordinator.js";
 import { LocalProjectionPlanner, type ProjectionPlan } from "./projection/planner.js";
 import { resolveAndPersistTaskAnchors } from "./store/anchor-resolutions.js";
 import { resolveAndPersistInteractionAnchors } from "./store/interaction-resolutions.js";
@@ -100,12 +103,22 @@ export interface TaskFrameworkServices {
   interactions: InteractionService;
   projection: ProjectionDiagnostics;
   inspector: LocalTaskInspector;
+  worker?: {
+    bootstrap: WorkerBootstrap;
+    registry: RunRegistry;
+    router: WorkerTaskRouter;
+  };
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
+  startWorker(ctx: ExtensionContext): Promise<void>;
 }
 
 export interface RegisterTaskFrameworkOptions {
   registerSessionStart?: boolean;
+  worker?: {
+    bootstrap: WorkerBootstrap;
+    registry: RunRegistry;
+  };
 }
 
 function textResult(text: string, details?: unknown): AgentToolResult<unknown> {
@@ -213,7 +226,14 @@ export function registerTaskFramework(
   const planner = new LocalProjectionPlanner();
   const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
   const inspector = new LocalTaskInspector(runtime, { projection });
+  const worker = options.worker
+    ? {
+        ...options.worker,
+        router: new WorkerTaskRouter(options.worker.registry, options.worker.bootstrap.sessionId, options.worker.bootstrap),
+      }
+    : undefined;
   let loadedSessionId: string | undefined;
+  let workerStarted = false;
 
   const reconstruct = (ctx: ExtensionContext): void => {
     runtime.reconstructFrom(store, ctx.sessionManager);
@@ -225,9 +245,55 @@ export function registerTaskFramework(
   };
   const appendFrom = (ctx: ExtensionContext) => (event: Parameters<typeof store.append>[0]) =>
     store.append(event, ctx);
+  const startWorker = async (ctx: ExtensionContext): Promise<void> => {
+    if (!worker || workerStarted) return;
+    ensureLoaded(ctx);
+    const bootstrap = worker.bootstrap;
+    if (
+      ctx.sessionManager.getSessionId() !== bootstrap.sessionId ||
+      ctx.sessionManager.getSessionFile() !== bootstrap.sessionFile
+    ) {
+      throw new Error(`Worker process did not adopt pre-created session ${bootstrap.sessionId}`);
+    }
+    runtime.adoptAssignedRoot(bootstrap.taskId, appendFrom(ctx));
+    await worker.registry.updateWorker(bootstrap.workerId, {
+      status: "running",
+      pid: process.pid,
+      startedAt: Date.now(),
+    });
+    workerStarted = true;
+    updateStatus(runtime, ctx);
+  };
 
   if (options.registerSessionStart !== false) {
-    pi.on("session_start", (_event, ctx) => reconstruct(ctx));
+    pi.on("session_start", async (_event, ctx) => {
+      reconstruct(ctx);
+      await startWorker(ctx);
+    });
+  }
+  if (worker) {
+    pi.on("session_shutdown", async (_event, ctx) => {
+      ensureLoaded(ctx);
+      const assigned = runtime.snapshot.tasks.get(worker.bootstrap.taskId);
+      if (assigned?.status === "open") {
+        runtime.failOpenTasks(
+          "Worker process shut down without completing its assigned root task",
+          ctx.sessionManager.getSessionId(),
+          () => ctx.sessionManager.getLeafId(),
+          appendFrom(ctx),
+        );
+      }
+      const terminal = runtime.snapshot.tasks.get(worker.bootstrap.taskId);
+      await worker.registry.updateWorker(worker.bootstrap.workerId, {
+        status: terminal?.status === "completed" ? "completed" : terminal?.status === "cancelled" ? "cancelled" : "failed",
+        exitCode: terminal?.status === "completed" ? 0 : 1,
+        exitedAt: Date.now(),
+        ...(terminal?.status === "completed"
+          ? {}
+          : { diagnostics: terminal?.status === "failed" ? "Worker-owned task stream records failure" : "Worker exited without successful task completion" }),
+      });
+      await worker.registry.releaseLease(worker.bootstrap.workerId);
+    });
   }
   pi.on("session_tree", (_event, ctx) => reconstruct(ctx));
   pi.on("turn_end", (_event, ctx) => {
@@ -506,8 +572,10 @@ export function registerTaskFramework(
     interactions,
     projection,
     inspector,
+    ...(worker ? { worker } : {}),
     reconstruct,
     ensureLoaded,
+    startWorker,
   };
 }
 

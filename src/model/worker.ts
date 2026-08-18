@@ -25,13 +25,19 @@ export type WorkerLifecycleStatus =
   | "cancelled";
 
 export interface WorkerRoute {
+  schemaVersion: 1;
   workerId: WorkerId;
   taskId: string;
   runId: RunId;
   sessionId: string;
   sessionFile: string;
+  spawningSessionId: string;
+  parentTaskId: string | null;
   pid?: number;
   status: WorkerLifecycleStatus;
-  exitCode?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
   diagnostics?: string;
+  startedAt?: number;
+  exitedAt?: number;
 }

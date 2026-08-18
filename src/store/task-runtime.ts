@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Config } from "../config.js";
 import type {
   TaskEvent,
@@ -15,7 +15,7 @@ import type { TaskSummary } from "../model/summary.js";
 import type { TranscriptAnchor } from "../transcript/anchors.js";
 import { applyPersistedAnchorResolutions } from "./anchor-resolutions.js";
 import { applyPersistedInteractionResolutions } from "./interaction-resolutions.js";
-import type { TaskEventIssue, TaskEventLog, TaskEventStore } from "./task-events.js";
+import { readTaskEventLog, type TaskEventIssue, type TaskEventLog, type TaskEventStore } from "./task-events.js";
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
@@ -27,6 +27,7 @@ export interface TaskRuntimeState {
   childDescriptions: Map<TaskId, string>;
   outputs: Map<string, PreservedOutput>;
   interactions: Map<string, ProtectedInteraction>;
+  workerSpawns: Map<TaskId, WorkerSpawnRequested>;
   issues: TaskEventIssue[];
 }
 
@@ -66,6 +67,7 @@ function emptyState(issues: TaskEventIssue[] = []): TaskRuntimeState {
     childDescriptions: new Map(),
     outputs: new Map(),
     interactions: new Map(),
+    workerSpawns: new Map(),
     issues: [...issues],
   };
 }
@@ -284,6 +286,11 @@ function applyWorkerSpawn(state: TaskRuntimeState, event: WorkerSpawnRequested, 
     state.issues.push(invalidTransition(entryId, "worker spawn parent does not match the active task"));
     return;
   }
+  if (state.workerSpawns.has(event.spawnedTaskId)) {
+    state.issues.push(invalidTransition(entryId, `duplicate worker spawn for ${event.spawnedTaskId}`));
+    return;
+  }
+  state.workerSpawns.set(event.spawnedTaskId, event);
   state.childDescriptions.set(event.spawnedTaskId, event.task);
   if (event.parentTaskId !== null) {
     const parent = state.tasks.get(event.parentTaskId);
@@ -309,8 +316,13 @@ export function applyTaskEvent(
         return;
       case "task_started": {
         assertTaskId(event.taskId, "task_started.taskId");
-        if (!state.tasks.has(event.taskId)) {
+        const task = state.tasks.get(event.taskId);
+        if (!task) {
           state.issues.push(invalidTransition(entryId, `task_started references unknown task ${event.taskId}`));
+        } else if (task.status !== "open") {
+          state.issues.push(invalidTransition(entryId, `task_started references terminal task ${event.taskId}`));
+        } else if (state.startedTaskIds.has(event.taskId)) {
+          state.issues.push(invalidTransition(entryId, `duplicate task_started for ${event.taskId}`));
         } else {
           state.startedTaskIds.add(event.taskId);
         }
@@ -428,6 +440,14 @@ export function reconstructTaskState(log: TaskEventLog): TaskRuntimeState {
   return state;
 }
 
+/** Reconstruct one owning session without requiring a live extension context. */
+export function reconstructTaskStateFromEntries(entries: readonly SessionEntry[]): TaskRuntimeState {
+  const state = reconstructTaskState(readTaskEventLog(entries));
+  applyPersistedAnchorResolutions(state, entries);
+  applyPersistedInteractionResolutions(state, entries);
+  return state;
+}
+
 function makeToolAnchor(
   context: TaskBoundaryContext,
   toolName: "begin_task" | "end_task",
@@ -450,7 +470,7 @@ export class LocalTaskRuntime {
 
   constructor(
     private readonly config: Config,
-    private readonly processId = randomUUID(),
+    private readonly processId: string = randomUUID(),
     private readonly createId: () => string = randomUUID,
     private readonly now: () => number = Date.now,
   ) {}
@@ -556,6 +576,58 @@ export class LocalTaskRuntime {
       { type: "output_preserved", at: this.now(), taskId: output.taskId, output },
       append,
     );
+  }
+
+  adoptAssignedRoot(taskId: TaskId, append: TaskEventAppender): void {
+    assertTaskId(taskId, "worker bootstrap task ID");
+    const task = this.state.tasks.get(taskId);
+    if (!task || task.execution.kind !== "worker" || task.localDepth !== 0) {
+      throw new Error(`Worker bootstrap cannot adopt assigned root ${taskId}`);
+    }
+    if (this.state.activeStack.length !== 1 || currentTaskId(this.state) !== taskId) {
+      throw new Error(`Assigned worker root ${taskId} is not the sole active execution root`);
+    }
+    if (this.state.startedTaskIds.has(taskId)) return;
+    this.persist({ type: "task_started", at: this.now(), taskId }, append);
+  }
+
+  recordWorkerSpawn(
+    event: Omit<WorkerSpawnRequested, "type" | "at" | "parentTaskId">,
+    append: TaskEventAppender,
+  ): WorkerSpawnRequested {
+    const spawn: WorkerSpawnRequested = {
+      type: "worker_spawn_requested",
+      at: this.now(),
+      parentTaskId: currentTaskId(this.state),
+      ...event,
+    };
+    this.persist(spawn, append);
+    return spawn;
+  }
+
+  failOpenTasks(
+    error: string,
+    sessionId: string,
+    currentLeafId: () => string | null,
+    append: TaskEventAppender,
+  ): TaskId[] {
+    const failed: TaskId[] = [];
+    while (this.activeTask()) {
+      const task = this.activeTask()!;
+      if (task.transcript.sessionId !== sessionId) {
+        throw new Error(`Cannot fail task ${task.id} from non-owning session ${sessionId}`);
+      }
+      const event: TaskFailed = {
+        type: "task_failed",
+        at: this.now(),
+        taskId: task.id,
+        endAnchor: { sessionId, entryId: currentLeafId(), boundary: "after" },
+        error,
+      };
+      this.persist(event, append);
+      failed.push(task.id);
+    }
+    return failed;
   }
 
   protect(interaction: ProtectedInteraction, at: number, append: TaskEventAppender): void {
