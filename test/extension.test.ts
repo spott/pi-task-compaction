@@ -54,6 +54,14 @@ function config(features: Config["features"]): Config {
   };
 }
 
+const taskTools = [
+  "begin_task",
+  "end_task",
+  "list_tasks",
+  "preserve_output",
+  "read_preserved_output",
+] as const;
+
 const arms = [
   {
     name: "vanilla",
@@ -64,32 +72,32 @@ const arms = [
   {
     name: "tasks only",
     features: { tasks: true, summaries: false, compaction: false, agents: false },
-    tools: ["begin_task", "end_task", "list_tasks"],
-    hooks: ["context", "session_start", "session_tree"],
+    tools: taskTools,
+    hooks: ["context", "session_start", "session_tree", "turn_end"],
   },
   {
     name: "tasks and summaries",
     features: { tasks: true, summaries: true, compaction: false, agents: false },
-    tools: ["begin_task", "end_task", "list_tasks"],
-    hooks: ["session_start", "session_tree"],
+    tools: taskTools,
+    hooks: ["session_start", "session_tree", "turn_end"],
   },
   {
     name: "tasks summaries compaction",
     features: { tasks: true, summaries: true, compaction: true, agents: false },
-    tools: ["begin_task", "end_task", "list_tasks"],
-    hooks: ["context", "session_before_compact", "session_start", "session_tree"],
+    tools: taskTools,
+    hooks: ["context", "session_before_compact", "session_start", "session_tree", "turn_end"],
   },
   {
     name: "tasks summaries agents",
     features: { tasks: true, summaries: true, compaction: false, agents: true },
-    tools: ["begin_task", "end_task", "list_tasks"],
-    hooks: ["session_start", "session_tree"],
+    tools: taskTools,
+    hooks: ["session_start", "session_tree", "turn_end"],
   },
   {
     name: "full",
     features: { tasks: true, summaries: true, compaction: true, agents: true },
-    tools: ["begin_task", "end_task", "list_tasks"],
-    hooks: ["context", "session_before_compact", "session_start", "session_tree"],
+    tools: taskTools,
+    hooks: ["context", "session_before_compact", "session_start", "session_tree", "turn_end"],
   },
 ] as const;
 
@@ -109,6 +117,17 @@ function assistant(toolCallId: string, name: string, args: Record<string, unknow
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason: "toolUse",
+    timestamp: Date.now(),
+  };
+}
+
+function toolResult(toolCallId: string, toolName: string, text: string) {
+  return {
+    role: "toolResult" as const,
+    toolCallId,
+    toolName,
+    content: [{ type: "text" as const, text }],
+    isError: false,
     timestamp: Date.now(),
   };
 }
@@ -231,6 +250,57 @@ describe("Pi task extension integration", () => {
     expect(services.runtime.snapshot.tasks.get(childId)?.status).toBe("completed");
     expect(services.runtime.snapshot.activeStack).toEqual([rootId]);
     expect(services.runtime.snapshot.issues).toEqual([]);
+  });
+
+  it("uses the same preservation path for delayed end-task selectors and exact reads", async () => {
+    const manager = SessionManager.inMemory("/tmp/task-framework-end-preservation-test");
+    const collected = collector((customType, data) => manager.appendCustomEntry(customType, data));
+    const services = registerTaskFramework(
+      collected.pi,
+      config({ tasks: true, summaries: true, compaction: false, agents: false }),
+    )!;
+    const { ctx } = context(manager);
+    await collected.handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+
+    manager.appendMessage(assistant("begin-preserve", "begin_task", { task: "preservation" }));
+    const beginResult = await collected.tools
+      .get("begin_task")
+      .execute("begin-preserve", { task: "preservation" }, undefined, undefined, ctx);
+    const taskId = beginResult.details.task_id as string;
+    manager.appendMessage(toolResult("begin-preserve", "begin_task", "opened"));
+    const beginResultEntryId = manager.getLeafId()!;
+    manager.appendMessage(assistant("ordinary-source", "read", { path: "important.txt" }));
+    manager.appendMessage(toolResult("ordinary-source", "read", "important contents"));
+    manager.appendMessage(assistant("end-preserve", "end_task", {
+      task_id: taskId,
+      ...summaryArgs,
+      preserve_outputs: [{ tool_call_id: "ordinary-source", pin: true }],
+    }));
+    const endResult = await collected.tools.get("end_task").execute(
+      "end-preserve",
+      {
+        task_id: taskId,
+        ...summaryArgs,
+        preserve_outputs: [{ tool_call_id: "ordinary-source", pin: true }],
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const outputId = endResult.details.preserved_outputs[0].output_id as string;
+    manager.appendMessage(toolResult("end-preserve", "end_task", "closed"));
+    const endResultEntryId = manager.getLeafId()!;
+    await collected.handlers.get("turn_end")![0]!({ type: "turn_end" }, ctx);
+    expect(services.runtime.snapshot.tasks.get(taskId)?.transcript).toMatchObject({
+      beginAnchor: { tool: { resultEntryId: beginResultEntryId } },
+      endAnchor: { tool: { resultEntryId: endResultEntryId } },
+    });
+    expect(services.runtime.snapshot.outputs.get(outputId)).toMatchObject({ pin: true, taskId });
+
+    const readResult = await collected.tools
+      .get("read_preserved_output")
+      .execute("read-output", { output_id: outputId }, undefined, undefined, ctx);
+    expect(readResult.content).toEqual([{ type: "text", text: "important contents" }]);
   });
 
   it("removes authored summary fields from the next context when retention is disabled", () => {

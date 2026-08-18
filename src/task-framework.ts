@@ -9,6 +9,8 @@ import { Type } from "typebox";
 import type { Config } from "./config.js";
 import type { TaskSummary } from "./model/summary.js";
 import { RetainingProjectionPlanner } from "./projection/planner.js";
+import { resolveAndPersistTaskAnchors } from "./store/anchor-resolutions.js";
+import { PreservationService } from "./store/preservation.js";
 import { PiTaskEventStore } from "./store/task-events.js";
 import {
   LocalTaskRuntime,
@@ -27,6 +29,13 @@ const PreserveOutputParams = Type.Object(
   {
     tool_call_id: Type.String({ minLength: 1 }),
     pin: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
+const ReadPreservedOutputParams = Type.Object(
+  {
+    output_id: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },
 );
@@ -63,6 +72,7 @@ type ReadonlySessionManager = ExtensionContext["sessionManager"];
 export interface TaskFrameworkServices {
   runtime: LocalTaskRuntime;
   config: Config;
+  preservation: PreservationService;
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
 }
@@ -171,6 +181,7 @@ export function registerTaskFramework(
 
   const store = new PiTaskEventStore(pi);
   const runtime = new LocalTaskRuntime(config, randomUUID());
+  const preservation = new PreservationService(runtime);
   const planner = new RetainingProjectionPlanner();
   let loadedSessionId: string | undefined;
 
@@ -189,6 +200,10 @@ export function registerTaskFramework(
     pi.on("session_start", (_event, ctx) => reconstruct(ctx));
   }
   pi.on("session_tree", (_event, ctx) => reconstruct(ctx));
+  pi.on("turn_end", (_event, ctx) => {
+    ensureLoaded(ctx);
+    resolveAndPersistTaskAnchors(runtime.snapshot, pi, ctx);
+  });
 
   if (!config.features.summaries || config.features.compaction) {
     pi.on("context", (event) => {
@@ -234,6 +249,52 @@ export function registerTaskFramework(
   });
 
   pi.registerTool({
+    name: "preserve_output",
+    label: "Preserve Output",
+    description:
+      "Preserve any completed ordinary tool result from the active task. Set pin=true only when its original protocol material must remain directly in context through task closure.",
+    promptSnippet: "Preserve an important completed tool result by tool-call ID",
+    promptGuidelines: [
+      "Preserve only outputs that will matter after task compaction; pin sparse immutable references that must remain verbatim in provider context.",
+    ],
+    parameters: PreserveOutputParams,
+    executionMode: "sequential",
+    async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+      ensureLoaded(ctx);
+      const result = preservation.preserve(params, toolCallId, ctx.sessionManager, appendFrom(ctx));
+      return textResult(
+        `${result.already_preserved ? "Reused" : "Preserved"} output ${result.output_id} from ${result.tool_name} call ${result.tool_call_id}${
+          result.pin ? ` with a ${result.closure_entry_count}-entry pinned protocol closure` : ""
+        }.`,
+        result,
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "read_preserved_output",
+    label: "Read Preserved Output",
+    description: "Integrity-check and re-emit the exact persisted text/image content of a preserved output.",
+    promptSnippet: "Recover an exact preserved tool result by output ID",
+    parameters: ReadPreservedOutputParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      ensureLoaded(ctx);
+      const result = preservation.read(params.output_id, ctx.sessionManager);
+      return {
+        content: result.content,
+        details: {
+          output_id: result.output.id,
+          task_id: result.output.taskId,
+          tool_call_id: result.output.source.toolCallId,
+          tool_name: result.output.source.toolName,
+          pin: result.output.pin,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "end_task",
     label: "End Task",
     description:
@@ -250,9 +311,21 @@ export function registerTaskFramework(
     executionMode: "sequential",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
       ensureLoaded(ctx);
-      if ((params.preserve_outputs?.length ?? 0) > 0) {
-        throw new Error("end_task.preserve_outputs requires the preservation milestone");
+      const activeTask = runtime.activeTask();
+      if (!activeTask || activeTask.id !== params.task_id) {
+        throw new Error(
+          activeTask
+            ? `end_task.task_id must be the active stack top (${activeTask.id})`
+            : "end_task requires an active task",
+        );
       }
+      const preserved = preservation.preserveForEnd(
+        params.task_id,
+        params.preserve_outputs ?? [],
+        toolCallId,
+        ctx.sessionManager,
+        appendFrom(ctx),
+      );
       const summary: TaskSummary = {
         objective: params.objective,
         outcome: params.outcome,
@@ -277,8 +350,8 @@ export function registerTaskFramework(
           result.restored_parent_task_id
             ? `Restored parent ${result.restored_parent_task_id}.`
             : "No local parent is active."
-        }`,
-        result,
+        }${preserved.length > 0 ? ` Preserved ${preserved.length} selected output(s).` : ""}`,
+        { ...result, preserved_outputs: preserved },
       );
     },
   });
@@ -331,7 +404,7 @@ export function registerTaskFramework(
     },
   });
 
-  return { runtime, config, reconstruct, ensureLoaded };
+  return { runtime, config, preservation, reconstruct, ensureLoaded };
 }
 
 export { stripUnretainedSummaries };

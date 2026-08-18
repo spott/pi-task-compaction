@@ -9,9 +9,11 @@ import type {
   TaskCancelled,
   WorkerSpawnRequested,
 } from "../model/events.js";
+import type { PreservedOutput } from "../model/output.js";
 import type { Task, TaskId, TaskListItem } from "../model/task.js";
 import type { TaskSummary } from "../model/summary.js";
 import type { TranscriptAnchor } from "../transcript/anchors.js";
+import { applyPersistedAnchorResolutions } from "./anchor-resolutions.js";
 import type { TaskEventIssue, TaskEventLog, TaskEventStore } from "./task-events.js";
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
@@ -22,6 +24,7 @@ export interface TaskRuntimeState {
   activeStack: TaskId[];
   startedTaskIds: Set<TaskId>;
   childDescriptions: Map<TaskId, string>;
+  outputs: Map<string, PreservedOutput>;
   issues: TaskEventIssue[];
 }
 
@@ -59,6 +62,7 @@ function emptyState(issues: TaskEventIssue[] = []): TaskRuntimeState {
     activeStack: [],
     startedTaskIds: new Set(),
     childDescriptions: new Map(),
+    outputs: new Map(),
     issues: [...issues],
   };
 }
@@ -317,12 +321,54 @@ export function applyTaskEvent(
       case "output_preserved": {
         assertTaskId(event.taskId, "output_preserved.taskId");
         const task = state.tasks.get(event.taskId);
+        const output = event.output;
         if (!task) {
           state.issues.push(invalidTransition(entryId, "output preservation references an unknown task"));
-        } else if (event.output.taskId !== event.taskId || typeof event.output.id !== "string") {
-          state.issues.push(invalidTransition(entryId, "output preservation task provenance is inconsistent"));
+        } else if (task.status !== "open") {
+          state.issues.push(invalidTransition(entryId, "output preservation references a terminal task"));
+        } else if (
+          output.taskId !== event.taskId ||
+          typeof output.id !== "string" ||
+          output.id === "" ||
+          typeof output.pin !== "boolean" ||
+          typeof output.source !== "object" ||
+          output.source === null ||
+          typeof output.source.sessionId !== "string" ||
+          output.source.sessionId !== task.transcript.sessionId ||
+          typeof output.source.toolCallId !== "string" ||
+          typeof output.source.toolName !== "string" ||
+          typeof output.source.assistantEntryId !== "string" ||
+          typeof output.source.resultEntryId !== "string" ||
+          typeof output.source.callHash !== "string" ||
+          typeof output.source.resultHash !== "string" ||
+          (output.pin && (!Array.isArray(output.source.closure) || output.source.closure.length === 0)) ||
+          (!output.pin && output.source.closure !== undefined) ||
+          (output.source.closure !== undefined &&
+            !output.source.closure.every(
+              (item) =>
+                typeof item === "object" &&
+                item !== null &&
+                typeof item.entryId === "string" &&
+                typeof item.hash === "string",
+            ))
+        ) {
+          state.issues.push(invalidTransition(entryId, "output preservation provenance is inconsistent"));
+        } else if (state.outputs.has(output.id)) {
+          state.issues.push(invalidTransition(entryId, `duplicate preserved output ${output.id}`));
+        } else if (
+          [...state.outputs.values()].some(
+            (candidate) =>
+              candidate.taskId === output.taskId &&
+              candidate.source.sessionId === output.source.sessionId &&
+              candidate.source.toolCallId === output.source.toolCallId,
+          )
+        ) {
+          state.issues.push(
+            invalidTransition(entryId, `tool call ${output.source.toolCallId} was already preserved for this task`),
+          );
         } else {
-          appendUnique(task.preservedOutputs, event.output.id);
+          state.outputs.set(output.id, output);
+          appendUnique(task.preservedOutputs, output.id);
         }
         return;
       }
@@ -386,6 +432,7 @@ export class LocalTaskRuntime {
 
   reconstructFrom(store: TaskEventStore, sessionManager: ReadonlySessionManager): void {
     this.reconstruct(store.read(sessionManager));
+    applyPersistedAnchorResolutions(this.state, sessionManager.getBranch());
   }
 
   private persist(event: TaskEvent, append: TaskEventAppender): void {
@@ -464,6 +511,17 @@ export class LocalTaskRuntime {
     };
   }
 
+  preserve(output: PreservedOutput, append: TaskEventAppender): void {
+    const activeTask = this.activeTask();
+    if (!activeTask || activeTask.id !== output.taskId) {
+      throw new Error("preserved output must belong to the active stack top");
+    }
+    this.persist(
+      { type: "output_preserved", at: this.now(), taskId: output.taskId, output },
+      append,
+    );
+  }
+
   activeTask(): Task | undefined {
     const id = currentTaskId(this.state);
     return id === null ? undefined : this.state.tasks.get(id);
@@ -516,10 +574,10 @@ export class LocalTaskRuntime {
         taskId: childId,
         task: this.state.childDescriptions.get(childId) ?? "(unresolved task)",
       }));
-      const pinnedOutputCount = task.preservedOutputs.reduce((count, outputId) => {
-        // Pin metadata is resolved by the preservation service in M4.
-        return count + (outputId.startsWith("pin:") ? 1 : 0);
-      }, 0);
+      const pinnedOutputCount = task.preservedOutputs.reduce(
+        (count, outputId) => count + (this.state.outputs.get(outputId)?.pin ? 1 : 0),
+        0,
+      );
       return [
         {
           id: task.id,

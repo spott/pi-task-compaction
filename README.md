@@ -6,7 +6,7 @@ This `main` branch is the greenfield v2 implementation. The previous implementat
 
 The v2 architecture separates semantic task events, transcript provenance, context projection, inspection artifacts, worker routing, and global compaction. Public behavior follows **API v2** when it differs from the implementation plan.
 
-The semantic foundation currently provides hierarchical `begin_task`, `end_task`, and `list_tasks`, plus `/tasks`. Task state is reconstructed from branch-local Pi custom entries. Later v2 milestones add preservation, projection, inspection, workers, and task-aware global compaction.
+The current v2 slice provides hierarchical `begin_task`, `end_task`, and `list_tasks`, plus `/tasks`. Task state is reconstructed from branch-local Pi custom entries. `preserve_output` can preserve any eligible completed ordinary tool result in the active task; immutable `pin: true` records the full original multi-call protocol closure. `end_task.preserve_outputs` uses the same path, and `read_preserved_output` integrity-checks and re-emits persisted text/image blocks. Later milestones add task projection, interaction protection, inspection, workers, and task-aware global compaction.
 
 ## Configuration
 
