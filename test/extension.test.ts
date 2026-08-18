@@ -57,6 +57,7 @@ function config(features: Config["features"]): Config {
 const taskTools = [
   "begin_task",
   "end_task",
+  "inspect_task",
   "list_tasks",
   "preserve_output",
   "read_preserved_output",
@@ -185,7 +186,7 @@ describe("config-gated extension surface", () => {
   });
 
   for (const arm of arms) {
-    it(`registers the exact M6 surface for ${arm.name}`, () => {
+    it(`registers the exact M7 surface for ${arm.name}`, () => {
       const collected = collector();
       registerTaskFramework(collected.pi, config({ ...arm.features }));
       expect([...collected.tools.keys()].sort()).toEqual([...arm.tools].sort());

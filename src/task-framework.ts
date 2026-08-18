@@ -7,6 +7,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Config } from "./config.js";
+import { LocalTaskInspector } from "./inspect/inspect.js";
 import type { TaskSummary } from "./model/summary.js";
 import { LocalProjectionPlanner, type ProjectionPlan } from "./projection/planner.js";
 import { resolveAndPersistTaskAnchors } from "./store/anchor-resolutions.js";
@@ -71,6 +72,20 @@ const ListTasksParams = Type.Object(
   { additionalProperties: false },
 );
 
+const InspectTaskParams = Type.Object(
+  {
+    task_id: Type.String({ minLength: 1 }),
+    view: Type.Optional(
+      StringEnum(["summary", "list", "search", "entry", "transcript"] as const),
+    ),
+    query: Type.Optional(Type.String()),
+    entry: Type.Optional(Type.String({ minLength: 1 })),
+    cursor: Type.Optional(Type.String({ minLength: 1 })),
+    max_chars: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 50_000 })),
+  },
+  { additionalProperties: false },
+);
+
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
 export interface ProjectionDiagnostics {
@@ -84,6 +99,7 @@ export interface TaskFrameworkServices {
   preservation: PreservationService;
   interactions: InteractionService;
   projection: ProjectionDiagnostics;
+  inspector: LocalTaskInspector;
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
 }
@@ -196,6 +212,7 @@ export function registerTaskFramework(
   const interactions = new InteractionService(runtime);
   const planner = new LocalProjectionPlanner();
   const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
+  const inspector = new LocalTaskInspector(runtime, { projection });
   let loadedSessionId: string | undefined;
 
   const reconstruct = (ctx: ExtensionContext): void => {
@@ -416,6 +433,25 @@ export function registerTaskFramework(
   });
 
   pi.registerTool({
+    name: "inspect_task",
+    label: "Inspect Task",
+    description:
+      "Inspect one semantic task without restoring its entire historical body. Defaults to a compact summary; bounded list/search views lead to exact entry locators or a private complete transcript artifact.",
+    promptSnippet: "Inspect durable task metadata or selected persisted task history",
+    promptGuidelines: [
+      "Use summary first. Use bounded list or search to locate relevant entry IDs, then entry for an exact JSONL locator.",
+      "Use transcript only when jq/bash tooling genuinely needs the complete artifact. Transcript artifacts are private ephemeral caches and may contain sensitive content; do not copy them into the repository.",
+    ],
+    parameters: InspectTaskParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      ensureLoaded(ctx);
+      const result = await inspector.inspect(params, ctx.sessionManager);
+      return textResult(result.text, result.details);
+    },
+  });
+
+  pi.registerTool({
     name: "list_tasks",
     label: "List Tasks",
     description: "List compact semantic task-tree metadata on the active session branch.",
@@ -463,7 +499,16 @@ export function registerTaskFramework(
     },
   });
 
-  return { runtime, config, preservation, interactions, projection, reconstruct, ensureLoaded };
+  return {
+    runtime,
+    config,
+    preservation,
+    interactions,
+    projection,
+    inspector,
+    reconstruct,
+    ensureLoaded,
+  };
 }
 
 export { stripUnretainedSummaries };
