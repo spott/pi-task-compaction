@@ -8,8 +8,10 @@ import type {
 import { Type } from "typebox";
 import type { Config } from "./config.js";
 import type { TaskSummary } from "./model/summary.js";
-import { RetainingProjectionPlanner } from "./projection/planner.js";
+import { LocalProjectionPlanner, type ProjectionPlan } from "./projection/planner.js";
 import { resolveAndPersistTaskAnchors } from "./store/anchor-resolutions.js";
+import { resolveAndPersistInteractionAnchors } from "./store/interaction-resolutions.js";
+import { InteractionService } from "./store/interactions.js";
 import { PreservationService } from "./store/preservation.js";
 import { PiTaskEventStore } from "./store/task-events.js";
 import {
@@ -40,6 +42,8 @@ const ReadPreservedOutputParams = Type.Object(
   { additionalProperties: false },
 );
 
+const RespondToUserParams = Type.Object({}, { additionalProperties: false });
+
 const EndTaskParams = Type.Object(
   {
     task_id: Type.String({ minLength: 1 }),
@@ -69,10 +73,17 @@ const ListTasksParams = Type.Object(
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
+export interface ProjectionDiagnostics {
+  lastPlan?: ProjectionPlan;
+  rejectionCounts: Map<string, number>;
+}
+
 export interface TaskFrameworkServices {
   runtime: LocalTaskRuntime;
   config: Config;
   preservation: PreservationService;
+  interactions: InteractionService;
+  projection: ProjectionDiagnostics;
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
 }
@@ -182,7 +193,9 @@ export function registerTaskFramework(
   const store = new PiTaskEventStore(pi);
   const runtime = new LocalTaskRuntime(config, randomUUID());
   const preservation = new PreservationService(runtime);
-  const planner = new RetainingProjectionPlanner();
+  const interactions = new InteractionService(runtime);
+  const planner = new LocalProjectionPlanner();
+  const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
   let loadedSessionId: string | undefined;
 
   const reconstruct = (ctx: ExtensionContext): void => {
@@ -203,13 +216,31 @@ export function registerTaskFramework(
   pi.on("turn_end", (_event, ctx) => {
     ensureLoaded(ctx);
     resolveAndPersistTaskAnchors(runtime.snapshot, pi, ctx);
+    resolveAndPersistInteractionAnchors(runtime.snapshot, pi, ctx);
   });
 
   if (!config.features.summaries || config.features.compaction) {
-    pi.on("context", (event) => {
+    pi.on("context", (event, ctx) => {
+      ensureLoaded(ctx);
       let messages = event.messages;
       if (!config.features.summaries) messages = stripUnretainedSummaries(messages);
-      if (config.features.compaction) messages = planner.plan(messages, []).messages;
+      if (config.features.compaction) {
+        const plan = planner.plan({
+          messages,
+          sessionId: ctx.sessionManager.getSessionId(),
+          branchEntries: ctx.sessionManager.getBranch(),
+          contextEntries: ctx.sessionManager.buildContextEntries(),
+          state: runtime.snapshot,
+        });
+        projection.lastPlan = plan;
+        for (const rejection of plan.rejections) {
+          for (const reason of rejection.reasons) {
+            const key = `${rejection.taskId}: ${reason}`;
+            projection.rejectionCounts.set(key, (projection.rejectionCounts.get(key) ?? 0) + 1);
+          }
+        }
+        messages = plan.messages;
+      }
       return { messages };
     });
   }
@@ -295,6 +326,28 @@ export function registerTaskFramework(
   });
 
   pi.registerTool({
+    name: "respond_to_user",
+    label: "Respond to User",
+    description:
+      "Mark this assistant message as a verbatim response to the one currently unanswered user message in the active task. This must be the only tool call in the assistant message; the task remains active. API v2 leaves multi-message binding unsettled, so accumulated messages are rejected.",
+    promptSnippet: "Protect a user interaction verbatim while keeping the task active",
+    promptGuidelines: [
+      "When answering one user interruption during an active task, call respond_to_user as the only tool in that assistant message if the exchange should survive task compaction verbatim; do not accumulate multiple unanswered messages before marking.",
+      "Unmarked user messages remain unanswered task input and are replayed after task closure only when projection removes their original occurrence.",
+    ],
+    parameters: RespondToUserParams,
+    executionMode: "sequential",
+    async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
+      ensureLoaded(ctx);
+      const result = interactions.protect(toolCallId, ctx.sessionManager, appendFrom(ctx));
+      return textResult(
+        `Protected ${result.protected_user_message_count} user message(s) as interaction ${result.interaction_id}. The active task remains open.`,
+        result,
+      );
+    },
+  });
+
+  pi.registerTool({
     name: "end_task",
     label: "End Task",
     description:
@@ -337,12 +390,18 @@ export function registerTaskFramework(
         verification: [...params.verification],
         open_threads: [...params.open_threads],
       };
+      const unansweredMessageCount = interactions.pendingBeforeMarker(
+        params.task_id,
+        toolCallId,
+        ctx.sessionManager,
+      ).length;
       const result = runtime.end(
         params.task_id,
         summary,
         config.features.summaries,
         boundaryContext(ctx, toolCallId, "end_task"),
         appendFrom(ctx),
+        unansweredMessageCount,
       );
       updateStatus(runtime, ctx);
       return textResult(
@@ -404,7 +463,7 @@ export function registerTaskFramework(
     },
   });
 
-  return { runtime, config, preservation, reconstruct, ensureLoaded };
+  return { runtime, config, preservation, interactions, projection, reconstruct, ensureLoaded };
 }
 
 export { stripUnretainedSummaries };

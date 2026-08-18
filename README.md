@@ -6,7 +6,9 @@ This `main` branch is the greenfield v2 implementation. The previous implementat
 
 The v2 architecture separates semantic task events, transcript provenance, context projection, inspection artifacts, worker routing, and global compaction. Public behavior follows **API v2** when it differs from the implementation plan.
 
-The current v2 slice provides hierarchical `begin_task`, `end_task`, and `list_tasks`, plus `/tasks`. Task state is reconstructed from branch-local Pi custom entries. `preserve_output` can preserve any eligible completed ordinary tool result in the active task; immutable `pin: true` records the full original multi-call protocol closure. `end_task.preserve_outputs` uses the same path, and `read_preserved_output` integrity-checks and re-emits persisted text/image blocks. Later milestones add task projection, interaction protection, inspection, workers, and task-aware global compaction.
+The current v2 implementation provides hierarchical `begin_task`, `end_task`, and `list_tasks`, plus `/tasks`. Task state is reconstructed from branch-local Pi custom entries. `preserve_output` can preserve any eligible completed ordinary tool result in the active task; immutable `pin: true` records the full original multi-call protocol closure. `end_task.preserve_outputs` uses the same path, and `read_preserved_output` integrity-checks and re-emits persisted text/image blocks.
+
+With task compaction enabled, completed task bodies are replaced in provider context by chronological pinned/protected survivors, a structured task summary, and any unanswered user messages whose original occurrence was removed. `respond_to_user` protects one user message and its marked assistant response verbatim while leaving the task open. API v2 leaves binding across several accumulated user messages unsettled, so that ambiguous marker case hard-errors instead of choosing a policy. Projection never rewrites the raw Pi session and retains any subtree whose protocol or provenance cannot be proven safe. Later milestones add task inspection, worker execution/routing, and task-aware global Pi compaction.
 
 ## Configuration
 

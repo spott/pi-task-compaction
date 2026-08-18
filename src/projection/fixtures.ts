@@ -35,7 +35,7 @@ export const PROJECTION_FIXTURE_CORPUS: readonly ProjectionFixtureContract[] = [
   { name: "interleaved pin protection pin", capabilities: ["pinning", "protection"], expectedInvariant: "all survivors remain in transcript order before summary" },
   { name: "multi-call assistant selected pin", capabilities: ["pinning", "compatibility"], expectedInvariant: "minimal valid original closure is retained without fabrication" },
   { name: "marked user response", capabilities: ["protection"], expectedInvariant: "user and assistant response survive verbatim" },
-  { name: "multiple user turns one marker", capabilities: ["protection"], expectedInvariant: "marker binding remains task-scoped" },
+  { name: "multiple user turns one marker", capabilities: ["protection", "ambiguity"], expectedInvariant: "API-unsettled multi-message binding hard-errors without losing inputs" },
   { name: "unanswered user message", capabilities: ["replay"], expectedInvariant: "removed original is replayed after summary" },
   { name: "multiple unanswered messages", capabilities: ["replay"], expectedInvariant: "replays preserve original order" },
   { name: "child replay into parent", capabilities: ["hierarchy", "replay"], expectedInvariant: "replay becomes parent-visible input" },

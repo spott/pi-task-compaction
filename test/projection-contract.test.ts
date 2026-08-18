@@ -33,7 +33,13 @@ describe("M1 projection contract", () => {
 
   it("retains ambiguous regions until protocol resolvers can prove safe projection", () => {
     const messages = [{ role: "user", content: "keep me", timestamp: 1 }] as any;
-    const result = new RetainingProjectionPlanner().plan(messages, []);
+    const result = new RetainingProjectionPlanner().plan({
+      messages,
+      sessionId: "session",
+      branchEntries: [],
+      contextEntries: [],
+      state: { tasks: new Map(), roots: [] },
+    } as any);
     expect(result.messages).toBe(messages);
     expect(result.projectedTaskIds).toEqual([]);
   });

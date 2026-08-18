@@ -9,11 +9,12 @@ import type {
   TaskCancelled,
   WorkerSpawnRequested,
 } from "../model/events.js";
-import type { PreservedOutput } from "../model/output.js";
+import type { PreservedOutput, ProtectedInteraction } from "../model/output.js";
 import type { Task, TaskId, TaskListItem } from "../model/task.js";
 import type { TaskSummary } from "../model/summary.js";
 import type { TranscriptAnchor } from "../transcript/anchors.js";
 import { applyPersistedAnchorResolutions } from "./anchor-resolutions.js";
+import { applyPersistedInteractionResolutions } from "./interaction-resolutions.js";
 import type { TaskEventIssue, TaskEventLog, TaskEventStore } from "./task-events.js";
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
@@ -25,6 +26,7 @@ export interface TaskRuntimeState {
   startedTaskIds: Set<TaskId>;
   childDescriptions: Map<TaskId, string>;
   outputs: Map<string, PreservedOutput>;
+  interactions: Map<string, ProtectedInteraction>;
   issues: TaskEventIssue[];
 }
 
@@ -63,6 +65,7 @@ function emptyState(issues: TaskEventIssue[] = []): TaskRuntimeState {
     startedTaskIds: new Set(),
     childDescriptions: new Map(),
     outputs: new Map(),
+    interactions: new Map(),
     issues: [...issues],
   };
 }
@@ -372,12 +375,42 @@ export function applyTaskEvent(
         }
         return;
       }
-      case "user_response_protected":
+      case "user_response_protected": {
         assertTaskId(event.taskId, "user_response_protected.taskId");
-        if (!state.tasks.has(event.taskId)) {
+        const task = state.tasks.get(event.taskId);
+        const interaction = event.interaction;
+        if (!task) {
           state.issues.push(invalidTransition(entryId, "protected response references an unknown task"));
+        } else if (task.status !== "open" || currentTaskId(state) !== task.id) {
+          state.issues.push(invalidTransition(entryId, "protected response must belong to the active stack top"));
+        } else if (
+          interaction.taskId !== event.taskId ||
+          !isUuid(interaction.id) ||
+          !Array.isArray(interaction.userEntryIds) ||
+          interaction.userEntryIds.length === 0 ||
+          !interaction.userEntryIds.every((id) => typeof id === "string" && id !== "") ||
+          new Set(interaction.userEntryIds).size !== interaction.userEntryIds.length ||
+          typeof interaction.assistantEntryId !== "string" ||
+          interaction.assistantEntryId === "" ||
+          typeof interaction.markerToolCallId !== "string" ||
+          interaction.markerToolCallId === ""
+        ) {
+          state.issues.push(invalidTransition(entryId, "protected response provenance is inconsistent"));
+        } else if (state.interactions.has(interaction.id)) {
+          state.issues.push(invalidTransition(entryId, `duplicate protected interaction ${interaction.id}`));
+        } else {
+          assertAnchor(interaction.range.start, "user_response_protected.interaction.range.start");
+          assertAnchor(interaction.range.end, "user_response_protected.interaction.range.end");
+          if (
+            interaction.range.start.sessionId !== task.transcript.sessionId ||
+            interaction.range.end.sessionId !== task.transcript.sessionId
+          ) {
+            throw new Error("protected response range belongs to a different session");
+          }
+          state.interactions.set(interaction.id, interaction);
         }
         return;
+      }
       case "worker_spawn_requested":
         applyWorkerSpawn(state, event, entryId);
         return;
@@ -432,7 +465,9 @@ export class LocalTaskRuntime {
 
   reconstructFrom(store: TaskEventStore, sessionManager: ReadonlySessionManager): void {
     this.reconstruct(store.read(sessionManager));
-    applyPersistedAnchorResolutions(this.state, sessionManager.getBranch());
+    const branch = sessionManager.getBranch();
+    applyPersistedAnchorResolutions(this.state, branch);
+    applyPersistedInteractionResolutions(this.state, branch);
   }
 
   private persist(event: TaskEvent, append: TaskEventAppender): void {
@@ -482,6 +517,7 @@ export class LocalTaskRuntime {
     retainSummary: boolean,
     context: TaskBoundaryContext,
     append: TaskEventAppender,
+    unansweredMessageCount = 0,
   ): EndTaskResult {
     assertTaskId(taskId, "end_task.task_id");
     const activeTaskId = currentTaskId(this.state);
@@ -507,7 +543,7 @@ export class LocalTaskRuntime {
       status: "completed",
       restored_parent_task_id: currentTaskId(this.state),
       direct_children: directChildren,
-      unanswered_message_count: 0,
+      unanswered_message_count: unansweredMessageCount,
     };
   }
 
@@ -518,6 +554,22 @@ export class LocalTaskRuntime {
     }
     this.persist(
       { type: "output_preserved", at: this.now(), taskId: output.taskId, output },
+      append,
+    );
+  }
+
+  protect(interaction: ProtectedInteraction, at: number, append: TaskEventAppender): void {
+    const activeTask = this.activeTask();
+    if (!activeTask || activeTask.id !== interaction.taskId) {
+      throw new Error("protected interaction must belong to the active stack top");
+    }
+    this.persist(
+      {
+        type: "user_response_protected",
+        at,
+        taskId: interaction.taskId,
+        interaction,
+      },
       append,
     );
   }

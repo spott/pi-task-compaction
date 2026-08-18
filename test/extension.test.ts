@@ -60,6 +60,7 @@ const taskTools = [
   "list_tasks",
   "preserve_output",
   "read_preserved_output",
+  "respond_to_user",
 ] as const;
 
 const arms = [
@@ -184,7 +185,7 @@ describe("config-gated extension surface", () => {
   });
 
   for (const arm of arms) {
-    it(`registers the exact M2 surface for ${arm.name}`, () => {
+    it(`registers the exact M6 surface for ${arm.name}`, () => {
       const collected = collector();
       registerTaskFramework(collected.pi, config({ ...arm.features }));
       expect([...collected.tools.keys()].sort()).toEqual([...arm.tools].sort());
@@ -301,6 +302,44 @@ describe("Pi task extension integration", () => {
       .get("read_preserved_output")
       .execute("read-output", { output_id: outputId }, undefined, undefined, ctx);
     expect(readResult.content).toEqual([{ type: "text", text: "important contents" }]);
+  });
+
+  it("wires task projection and replay into the compaction context hook", async () => {
+    const manager = SessionManager.inMemory("/tmp/task-framework-context-projection-test");
+    const collected = collector((customType, data) => manager.appendCustomEntry(customType, data));
+    const services = registerTaskFramework(
+      collected.pi,
+      config({ tasks: true, summaries: true, compaction: true, agents: false }),
+    )!;
+    const { ctx } = context(manager);
+    await collected.handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+
+    manager.appendMessage(assistant("begin-project", "begin_task", { task: "project" }));
+    const beginResult = await collected.tools
+      .get("begin_task")
+      .execute("begin-project", { task: "project" }, undefined, undefined, ctx);
+    const taskId = beginResult.details.task_id as string;
+    manager.appendMessage(toolResult("begin-project", "begin_task", "opened"));
+    manager.appendMessage({ role: "user", content: "Replay through hook", timestamp: Date.now() });
+    manager.appendMessage(assistant("end-project", "end_task", { task_id: taskId, ...summaryArgs }));
+    const endResult = await collected.tools
+      .get("end_task")
+      .execute("end-project", { task_id: taskId, ...summaryArgs }, undefined, undefined, ctx);
+    expect(endResult.details.unanswered_message_count).toBe(1);
+    manager.appendMessage(toolResult("end-project", "end_task", "closed"));
+
+    const messages = manager.buildSessionContext().messages;
+    const transformed = await collected.handlers.get("context")![0]!
+      ({ type: "context", messages }, ctx);
+    expect(transformed.messages.filter((message: AgentMessage) => message.role === "custom")).toHaveLength(1);
+    expect(
+      transformed.messages.filter(
+        (message: AgentMessage) => message.role === "user" && message.content === "Replay through hook",
+      ),
+    ).toHaveLength(1);
+    expect(transformed.messages.at(-1)).toMatchObject({ role: "user", content: "Replay through hook" });
+    expect(services.projection.lastPlan?.projectedTaskIds).toEqual([taskId]);
+    expect(services.projection.rejectionCounts.size).toBe(0);
   });
 
   it("removes authored summary fields from the next context when retention is disabled", () => {

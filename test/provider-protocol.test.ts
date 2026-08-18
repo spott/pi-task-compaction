@@ -1,6 +1,7 @@
 import { stream as streamAnthropic } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as streamCodex } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as streamOpenAI } from "@earendil-works/pi-ai/api/openai-responses";
+import { convertToLlm, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
   AssistantMessage,
   AssistantMessageEventStream,
@@ -74,9 +75,10 @@ async function capturePayload(
   stream: CaptureStream,
   requestModel: Model<any>,
   apiKey: string,
+  requestContext: Context = context,
 ): Promise<Record<string, unknown>> {
   let payload: unknown;
-  const events = stream(requestModel, context, {
+  const events = stream(requestModel, requestContext, {
     apiKey,
     transport: "sse",
     cacheRetention: "none",
@@ -143,6 +145,99 @@ describe("Pi 0.84.1 provider protocol closures", () => {
         { type: "function_call_output", call_id: "call-a", output: "A" },
         { type: "function_call_output", call_id: "call-b", output: "B" },
       ]);
+    });
+  }
+});
+
+const responseAssistant: AssistantMessage = {
+  ...assistant,
+  content: [
+    { type: "text", text: "durable response" },
+    { type: "toolCall", id: "respond", name: "respond_to_user", arguments: {} },
+  ],
+};
+
+const projectedAgentMessages = [
+  assistant,
+  result("call-a", "read", "A"),
+  result("call-b", "bash", "B"),
+  { role: "user", content: "one protected question", timestamp: 3 },
+  responseAssistant,
+  result("respond", "respond_to_user", "protected"),
+  {
+    role: "custom",
+    customType: "pi-task-framework/task-summary",
+    content: "<task-summary id=\"task\">projected summary</task-summary>",
+    display: false,
+    details: { taskId: "task" },
+    timestamp: 4,
+  },
+] as AgentMessage[];
+
+const replayAgentMessages = [
+  {
+    role: "custom",
+    customType: "pi-task-framework/task-summary",
+    content: "<task-summary id=\"task\">replay summary</task-summary>",
+    display: false,
+    details: { taskId: "task" },
+    timestamp: 4,
+  },
+  { role: "user", content: "one replayed question", timestamp: 5 },
+] as AgentMessage[];
+
+const providerFixtures = [
+  {
+    name: "Anthropic Messages",
+    stream: streamAnthropic as CaptureStream,
+    model: model("anthropic-messages", "anthropic"),
+    apiKey: "fixture-key",
+  },
+  {
+    name: "OpenAI Responses",
+    stream: streamOpenAI as CaptureStream,
+    model: model("openai-responses", "openai"),
+    apiKey: "fixture-key",
+  },
+  {
+    name: "Codex Responses",
+    stream: streamCodex as CaptureStream,
+    model: model("openai-codex-responses", "openai-codex"),
+    apiKey: `x.${Buffer.from(
+      JSON.stringify({
+        "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
+      }),
+    ).toString("base64url")}.x`,
+  },
+] as const;
+
+function occurrenceCount(value: unknown, text: string): number {
+  return JSON.stringify(value).split(text).length - 1;
+}
+
+describe("projected history provider serialization", () => {
+  for (const fixture of providerFixtures) {
+    it(`serializes pin/protection/summary survivors through ${fixture.name}`, async () => {
+      const payload = await capturePayload(
+        fixture.stream,
+        fixture.model,
+        fixture.apiKey,
+        { messages: convertToLlm(projectedAgentMessages) },
+      );
+      expect(occurrenceCount(payload, "one protected question")).toBe(1);
+      expect(occurrenceCount(payload, "projected summary")).toBe(1);
+      expect(JSON.stringify(payload)).toContain("respond_to_user");
+    });
+
+    it(`serializes a replay exactly once after a summary through ${fixture.name}`, async () => {
+      const payload = await capturePayload(
+        fixture.stream,
+        fixture.model,
+        fixture.apiKey,
+        { messages: convertToLlm(replayAgentMessages) },
+      );
+      expect(occurrenceCount(payload, "one replayed question")).toBe(1);
+      expect(occurrenceCount(payload, "replay summary")).toBe(1);
     });
   }
 });
