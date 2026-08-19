@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "vitest";
 import taskFrameworkExtension from "../extensions/task-framework.js";
 import { CONFIG_FLAGS, type Config } from "../src/config.js";
+import { taskFrameworkGuidance } from "../src/guidance.js";
 import { TASK_EVENT_CUSTOM_TYPE } from "../src/model/events.js";
 import { registerTaskFramework, stripUnretainedSummaries } from "../src/task-framework.js";
 
@@ -200,6 +201,36 @@ describe("config-gated extension surface", () => {
       expect([...collected.tools.keys()].sort()).toEqual([...arm.tools].sort());
       expect([...collected.handlers.keys()].sort()).toEqual([...arm.hooks].sort());
       expect([...collected.commands.keys()]).toEqual(arm.features.tasks ? ["tasks"] : []);
+      if (arm.features.tasks) {
+        const expected = taskFrameworkGuidance(config({ ...arm.features }));
+        expect({
+          beginTask: collected.tools.get("begin_task").promptGuidelines,
+          preserveOutput: collected.tools.get("preserve_output").promptGuidelines,
+          respondToUser: collected.tools.get("respond_to_user").promptGuidelines,
+          endTask: collected.tools.get("end_task").promptGuidelines,
+          inspectTask: collected.tools.get("inspect_task").promptGuidelines,
+          ...(arm.features.agents
+            ? {
+                spawnTask: collected.tools.get("spawn_task").promptGuidelines,
+                pollTask: collected.tools.get("poll_task").promptGuidelines,
+                joinTasks: collected.tools.get("join_tasks").promptGuidelines,
+              }
+            : {}),
+        }).toEqual({
+          beginTask: expected.beginTask,
+          preserveOutput: expected.preserveOutput,
+          respondToUser: expected.respondToUser,
+          endTask: expected.endTask,
+          inspectTask: expected.inspectTask,
+          ...(arm.features.agents
+            ? {
+                spawnTask: expected.spawnTask,
+                pollTask: expected.pollTask,
+                joinTasks: expected.joinTasks,
+              }
+            : {}),
+        });
+      }
     });
   }
 });
@@ -349,6 +380,68 @@ describe("Pi task extension integration", () => {
     expect(transformed.messages.at(-1)).toMatchObject({ role: "user", content: "Replay through hook" });
     expect(services.projection.lastPlan?.projectedTaskIds).toEqual([taskId]);
     expect(services.projection.rejectionCounts.size).toBe(0);
+  });
+
+  it("routes manual, threshold, and overflow compaction through the task-aware compactor", async () => {
+    const manager = SessionManager.inMemory("/tmp/task-framework-global-hook-test");
+    manager.appendMessage({ role: "user", content: "old", timestamp: Date.now() });
+    const firstKeptEntryId = manager.getLeafId()!;
+    const collected = collector((customType, data) => manager.appendCustomEntry(customType, data));
+    const calls: string[] = [];
+    const services = registerTaskFramework(
+      collected.pi,
+      config({ tasks: true, summaries: true, compaction: true, agents: false }),
+      {
+        globalCompactor: {
+          async compact(event) {
+            calls.push(event.reason);
+            return {
+              cancel: true,
+              diagnostics: {
+                requestedFirstKeptEntryId: firstKeptEntryId,
+                alignedFirstKeptEntryId: firstKeptEntryId,
+                alignment: "unchanged",
+                projectedTaskIds: [],
+                projectionRejections: [],
+                cancelledReason: `fixture ${event.reason}`,
+              },
+            };
+          },
+        },
+      },
+    )!;
+    const { ctx, notifications } = context(manager);
+    await collected.handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+    const handler = collected.handlers.get("session_before_compact")![0]!;
+    for (const reason of ["manual", "threshold", "overflow"] as const) {
+      const result = await handler(
+        {
+          type: "session_before_compact",
+          preparation: {
+            firstKeptEntryId,
+            messagesToSummarize: [],
+            turnPrefixMessages: [],
+            isSplitTurn: false,
+            tokensBefore: 100,
+            fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+            settings: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+          },
+          branchEntries: manager.getBranch(),
+          reason,
+          willRetry: reason === "overflow",
+          signal: new AbortController().signal,
+        },
+        ctx,
+      );
+      expect(result).toEqual({ cancel: true });
+    }
+    expect(calls).toEqual(["manual", "threshold", "overflow"]);
+    expect(services.projection.lastGlobalCompaction?.cancelledReason).toBe("fixture overflow");
+    expect(notifications).toEqual([
+      "Task-aware compaction cancelled: fixture manual",
+      "Task-aware compaction cancelled: fixture threshold",
+      "Task-aware compaction cancelled: fixture overflow",
+    ]);
   });
 
   it("removes authored summary fields from the next context when retention is disabled", () => {

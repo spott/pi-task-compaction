@@ -14,7 +14,9 @@ With task compaction enabled, completed task bodies are replaced in provider con
 
 Agent mode adds asynchronous `spawn_task`, `poll_task`, and `join_tasks`. A spawn pre-creates a private Pi session with the assigned root's `TaskCreated` event, persists parent/root spawn provenance, and then launches a worker that adopts that source with a fresh local task-depth budget. Required completed summaries and compact available-task references are validated against the worker's visibility grants. Run-wide private lease files enforce concurrency and agent depth; joins return stream-verified summaries or explicit semantic/registry-derived failure evidence without cancelling siblings. `inspect_task`, `list_tasks`, and `read_preserved_output` route across visible worker-owned sessions. Workers share the current working tree, so callers remain responsible for avoiding conflicting edits. API v2 leaves model-visible cancellation unsettled, so no `cancel_task` tool is registered.
 
-Task-aware global Pi compaction remains the next implementation milestone.
+Global Pi compaction now runs the same projection planner used for routine provider context before asking the active Pi model for a structured checkpoint. Pi's requested raw cut point is aligned to task boundaries: completed, protocol-valid projected subtrees can be summarized as summaries/survivors, while open or ambiguous task regions remain wholly on the kept side. This applies to manual, threshold, overflow-retry, and repeated compaction. If an open task already spans the current Pi boundary and no safe prefix remains, compaction cancels rather than cutting through it.
+
+Workflow guidance is generated from the enabled feature set. Core task guidance covers bounded/non-trivial nesting, close-child-before-parent discipline, durable summaries, preservation, and inspection. Compaction guidance alone teaches pin/protection/replay behavior; agent guidance alone teaches independent shared-tree spawning, worker-local depth reset, useful parent overlap, sparse polling, and result-time joins. Disabled feature guidance is absent from ablation arms.
 
 ## Configuration
 

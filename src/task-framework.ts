@@ -7,6 +7,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Config } from "./config.js";
+import {
+  DefaultTaskAwareGlobalCompactor,
+  type GlobalCompactionDiagnostics,
+  type TaskAwareGlobalCompactor,
+} from "./compaction/global.js";
+import { taskFrameworkGuidance } from "./guidance.js";
 import { LocalTaskInspector, type InspectTaskRequest, type InspectTaskResult } from "./inspect/inspect.js";
 import type { TaskId, TaskListItem } from "./model/task.js";
 import type { TaskSummary } from "./model/summary.js";
@@ -123,6 +129,7 @@ type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
 export interface ProjectionDiagnostics {
   lastPlan?: ProjectionPlan;
+  lastGlobalCompaction?: GlobalCompactionDiagnostics;
   rejectionCounts: Map<string, number>;
 }
 
@@ -146,6 +153,7 @@ export interface TaskFrameworkServices {
 
 export interface RegisterTaskFrameworkOptions {
   registerSessionStart?: boolean;
+  globalCompactor?: TaskAwareGlobalCompactor;
   agents?: {
     registry: RunRegistry;
     localSessionId: string;
@@ -342,6 +350,8 @@ export function registerTaskFramework(
   const preservation = new PreservationService(runtime);
   const interactions = new InteractionService(runtime);
   const planner = new LocalProjectionPlanner();
+  const globalCompactor = options.globalCompactor ?? new DefaultTaskAwareGlobalCompactor();
+  const guidance = taskFrameworkGuidance(config);
   const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
   const inspector = new LocalTaskInspector(runtime, { projection });
   const agents = options.agents
@@ -504,8 +514,22 @@ export function registerTaskFramework(
   }
 
   if (config.features.compaction) {
-    // M11 replaces this retaining hook with task-aware global compaction.
-    pi.on("session_before_compact", () => undefined);
+    pi.on("session_before_compact", async (event, ctx) => {
+      ensureLoaded(ctx);
+      const decision = await globalCompactor.compact(event, planner, {
+        ctx,
+        state: runtime.snapshot,
+      });
+      projection.lastGlobalCompaction = decision.diagnostics;
+      if (decision.cancel && decision.diagnostics.cancelledReason) {
+        ctx.ui.notify(`Task-aware compaction cancelled: ${decision.diagnostics.cancelledReason}`, "warning");
+      }
+      return decision.compaction
+        ? { compaction: decision.compaction }
+        : decision.cancel
+          ? { cancel: true }
+          : undefined;
+    });
   }
 
   pi.registerTool({
@@ -514,10 +538,7 @@ export function registerTaskFramework(
     description:
       "Start a semantic task. Nested calls create children; max_task_depth is enforced per process.",
     promptSnippet: "Start a hierarchical semantic task",
-    promptGuidelines: [
-      "Use begin_task for bounded work whose detailed transcript can later be replaced by a durable summary.",
-      "Close a child task before closing its parent.",
-    ],
+    promptGuidelines: guidance.beginTask,
     parameters: BeginTaskParams,
     executionMode: "sequential",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -540,12 +561,11 @@ export function registerTaskFramework(
   pi.registerTool({
     name: "preserve_output",
     label: "Preserve Output",
-    description:
-      "Preserve any completed ordinary tool result from the active task. Set pin=true only when its original protocol material must remain directly in context through task closure.",
+    description: config.features.compaction
+      ? "Preserve any completed ordinary tool result from the active task. Set pin=true only when its original protocol material must remain directly in context through task closure."
+      : "Preserve any completed ordinary tool result from the active task for later exact recovery by output ID.",
     promptSnippet: "Preserve an important completed tool result by tool-call ID",
-    promptGuidelines: [
-      "Preserve only outputs that will matter after task compaction; pin sparse immutable references that must remain verbatim in provider context.",
-    ],
+    promptGuidelines: guidance.preserveOutput,
     parameters: PreserveOutputParams,
     executionMode: "sequential",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -586,13 +606,11 @@ export function registerTaskFramework(
   pi.registerTool({
     name: "respond_to_user",
     label: "Respond to User",
-    description:
-      "Mark this assistant message as a verbatim response to the one currently unanswered user message in the active task. This must be the only tool call in the assistant message; the task remains active. API v2 leaves multi-message binding unsettled, so accumulated messages are rejected.",
+    description: config.features.compaction
+      ? "Mark this assistant message as a verbatim response to the one currently unanswered user message in the active task. This must be the only tool call in the assistant message; the task remains active. API v2 leaves multi-message binding unsettled, so accumulated messages are rejected."
+      : "Record this assistant message as a durable response to the one currently unanswered user message in the active task. This must be the only tool call in the assistant message; the task remains active.",
     promptSnippet: "Protect a user interaction verbatim while keeping the task active",
-    promptGuidelines: [
-      "When answering one user interruption during an active task, call respond_to_user as the only tool in that assistant message if the exchange should survive task compaction verbatim; do not accumulate multiple unanswered messages before marking.",
-      "Unmarked user messages remain unanswered task input and are replayed after task closure only when projection removes their original occurrence.",
-    ],
+    promptGuidelines: guidance.respondToUser,
     parameters: RespondToUserParams,
     executionMode: "sequential",
     async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -611,13 +629,7 @@ export function registerTaskFramework(
     description:
       "Close the active task with a structured summary. The task_id must identify the active stack top.",
     promptSnippet: "Close the active task and publish its structured result",
-    promptGuidelines: config.features.summaries
-      ? [
-          "Use end_task as soon as a task milestone is complete; make its summary sufficient to continue after detailed history is removed.",
-        ]
-      : [
-          "Use end_task to close completed work; this ablation authors the normal summary but does not retain it after the turn.",
-        ],
+    promptGuidelines: guidance.endTask,
     parameters: EndTaskParams,
     executionMode: "sequential",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
@@ -679,10 +691,7 @@ export function registerTaskFramework(
     description:
       "Inspect one semantic task without restoring its entire historical body. Defaults to a compact summary; bounded list/search views lead to exact entry locators or a private complete transcript artifact.",
     promptSnippet: "Inspect durable task metadata or selected persisted task history",
-    promptGuidelines: [
-      "Use summary first. Use bounded list or search to locate relevant entry IDs, then entry for an exact JSONL locator.",
-      "Use transcript only when jq/bash tooling genuinely needs the complete artifact. Transcript artifacts are private ephemeral caches and may contain sensitive content; do not copy them into the repository.",
-    ],
+    promptGuidelines: guidance.inspectTask,
     parameters: InspectTaskParams,
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -726,10 +735,7 @@ export function registerTaskFramework(
       description:
         "Start an independent semantic task in another Pi process and return immediately. The shared working tree is not isolated; spawn only work that is safe to run concurrently.",
       promptSnippet: "Spawn an asynchronous worker task",
-      promptGuidelines: [
-        "Use spawn_task for genuinely independent work, with or without an active local task. Continue useful parent work while the worker runs.",
-        "Workers share the current working tree. Avoid concurrent conflicting edits; use required_context only for completed retained summaries and available_context for optional task references.",
-      ],
+      promptGuidelines: guidance.spawnTask,
       parameters: SpawnTaskParams,
       executionMode: "sequential",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -753,7 +759,7 @@ export function registerTaskFramework(
       label: "Poll Task",
       description: "Check one spawned worker task's compact lifecycle status without returning transcript content.",
       promptSnippet: "Poll asynchronous worker status",
-      promptGuidelines: ["Poll sparingly; use join_tasks when worker results are actually needed."],
+      promptGuidelines: guidance.pollTask,
       parameters: PollTaskParams,
       executionMode: "parallel",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -779,9 +785,7 @@ export function registerTaskFramework(
       description:
         "Wait for all requested workers (default) or the first terminal worker. Completed results include authoritative durable task summaries; failures retain their evidence source.",
       promptSnippet: "Wait for asynchronous worker results",
-      promptGuidelines: [
-        "Join only when results are needed. wait=all does not cancel siblings after a failure; wait=any returns when the first requested task becomes terminal.",
-      ],
+      promptGuidelines: guidance.joinTasks,
       parameters: JoinTasksParams,
       executionMode: "sequential",
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
