@@ -18,6 +18,8 @@ Global Pi compaction now runs the same projection planner used for routine provi
 
 Workflow guidance is generated from the enabled feature set. Core task guidance covers bounded/non-trivial nesting, close-child-before-parent discipline, durable summaries, preservation, and inspection. Compaction guidance alone teaches pin/protection/replay behavior; agent guidance alone teaches independent shared-tree spawning, worker-local depth reset, useful parent overlap, sparse polling, and result-time joins. Disabled feature guidance is absent from ablation arms.
 
+For evaluation, compaction-enabled context passes persist bounded, content-free `pi-task-framework/evaluation` records with raw/projected message, byte, and estimated-token counts; accepted pin/protection/replay counts; replay cascade depth; and rejection reasons. Successful and cancelled global-compaction decisions use the same telemetry stream. Semantic task/output/interaction records and private worker routing artifacts supply the remaining M13 measurements without exposing transcript bodies in telemetry.
+
 ## Configuration
 
 The extension reads `.pi/task-framework.json` by default. The full framework is enabled by default:

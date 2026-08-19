@@ -12,6 +12,10 @@ import {
   type GlobalCompactionDiagnostics,
   type TaskAwareGlobalCompactor,
 } from "./compaction/global.js";
+import {
+  recordContextProjection,
+  recordGlobalCompaction,
+} from "./evaluation/telemetry.js";
 import { taskFrameworkGuidance } from "./guidance.js";
 import { LocalTaskInspector, type InspectTaskRequest, type InspectTaskResult } from "./inspect/inspect.js";
 import type { TaskId, TaskListItem } from "./model/task.js";
@@ -501,6 +505,7 @@ export function registerTaskFramework(
           state: runtime.snapshot,
         });
         projection.lastPlan = plan;
+        recordContextProjection(pi, ctx.sessionManager.getSessionId(), plan);
         for (const rejection of plan.rejections) {
           for (const reason of rejection.reasons) {
             const key = `${rejection.taskId}: ${reason}`;
@@ -521,6 +526,12 @@ export function registerTaskFramework(
         state: runtime.snapshot,
       });
       projection.lastGlobalCompaction = decision.diagnostics;
+      recordGlobalCompaction(
+        pi,
+        ctx.sessionManager.getSessionId(),
+        event,
+        decision,
+      );
       if (decision.cancel && decision.diagnostics.cancelledReason) {
         ctx.ui.notify(`Task-aware compaction cancelled: ${decision.diagnostics.cancelledReason}`, "warning");
       }

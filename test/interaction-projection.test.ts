@@ -185,6 +185,13 @@ describe("M5 interaction ownership and replay", () => {
     expect(summaryMessages(projected.messages)).toHaveLength(1);
     expect(userTexts(projected.messages)).toEqual(["What did you find?"]);
     expect(projected.messages.at(-1)).toMatchObject({ role: "user", content: "What did you find?" });
+    expect(projected.metrics).toMatchObject({
+      replayedMessageCount: 1,
+      maxReplayCascadeDepth: 1,
+      protectedInteractionCount: 0,
+    });
+    expect(projected.metrics.inputEstimatedTokens).toBeGreaterThan(0);
+    expect(projected.metrics.outputEstimatedTokens).toBeGreaterThan(0);
   });
 
   it("protects one pending message with an isolated marked response and emits no replay", () => {
@@ -214,6 +221,11 @@ describe("M5 interaction ownership and replay", () => {
     expect(response).toBeDefined();
     expect(JSON.stringify(response)).toContain("Here is the durable answer.");
     expect(projected.messages.at(-1)).toMatchObject({ role: "custom" });
+    expect(projected.metrics).toMatchObject({
+      replayedMessageCount: 0,
+      maxReplayCascadeDepth: 0,
+      protectedInteractionCount: 1,
+    });
   });
 
   it("rejects multiple-message response binding because API v2 leaves it unsettled", () => {
@@ -257,6 +269,10 @@ describe("M5 interaction ownership and replay", () => {
     expect(JSON.stringify(summaryMessages(parentProjected.messages))).toContain(`${child.task_id} — child`);
     expect(userTexts(parentProjected.messages)).toEqual(["Carry me outward"]);
     expect(parentProjected.messages.at(-1)).toMatchObject({ role: "user", content: "Carry me outward" });
+    expect(parentProjected.metrics).toMatchObject({
+      replayedMessageCount: 1,
+      maxReplayCascadeDepth: 2,
+    });
   });
 
   it("lets a restored parent protect a child replay without duplicating the raw user entry", () => {
@@ -325,6 +341,9 @@ describe("M6 local task projection", () => {
     expect(JSON.stringify(projected.messages)).not.toContain("replaceable tail");
     expect(JSON.stringify(projected.messages)).toContain(pinned.output_id);
     expect(runtime.snapshot.outputs.get(pinned.output_id)?.pin).toBe(true);
+    expect(projected.metrics.pinnedClosureEntryCount).toBe(3);
+    expect(projected.metrics.pinnedClosureEstimatedTokens).toBeGreaterThan(0);
+    expect(projected.metrics.projectedRawMessageCount).toBeGreaterThan(projected.metrics.outputMessageCount);
   });
 
   it("orders interleaved pin, protected interaction, and pin survivors chronologically", () => {

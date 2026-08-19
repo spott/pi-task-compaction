@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+  estimateTokens,
   sessionEntryToContextMessages,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
@@ -44,10 +45,26 @@ export interface ProjectionRejection {
   reasons: string[];
 }
 
+export interface ProjectionPlanMetrics {
+  inputMessageCount: number;
+  outputMessageCount: number;
+  inputEstimatedTokens: number;
+  outputEstimatedTokens: number;
+  inputSerializedBytes: number;
+  outputSerializedBytes: number;
+  projectedRawMessageCount: number;
+  pinnedClosureEntryCount: number;
+  pinnedClosureEstimatedTokens: number;
+  protectedInteractionCount: number;
+  replayedMessageCount: number;
+  maxReplayCascadeDepth: number;
+}
+
 export interface ProjectionPlan {
   messages: AgentMessage[];
   projectedTaskIds: TaskId[];
   rejections: ProjectionRejection[];
+  metrics: ProjectionPlanMetrics;
 }
 
 export interface ProjectionInput {
@@ -81,6 +98,10 @@ interface CandidateProjection {
   endMessageIndex: number;
   replacement: AgentMessage[];
   projectedTaskIds: TaskId[];
+  pinnedClosureEntryIds: string[];
+  protectedInteractionCount: number;
+  replayedMessageCount: number;
+  maxReplayCascadeDepth: number;
 }
 
 export function chronologicalSurvivors(survivors: readonly Survivor[]): Survivor[] {
@@ -157,6 +178,30 @@ function replayMessages(messages: readonly PendingUserMessage[]): AgentMessage[]
   return messages.map((item) => ({ ...item.message }));
 }
 
+function serializedBytes(messages: readonly AgentMessage[]): number {
+  return messages.reduce(
+    (total, message) => total + Buffer.byteLength(canonicalJson(message), "utf8") + 1,
+    0,
+  );
+}
+
+function baseMetrics(input: readonly AgentMessage[], output: readonly AgentMessage[]): ProjectionPlanMetrics {
+  return {
+    inputMessageCount: input.length,
+    outputMessageCount: output.length,
+    inputEstimatedTokens: input.reduce((total, message) => total + estimateTokens(message), 0),
+    outputEstimatedTokens: output.reduce((total, message) => total + estimateTokens(message), 0),
+    inputSerializedBytes: serializedBytes(input),
+    outputSerializedBytes: serializedBytes(output),
+    projectedRawMessageCount: 0,
+    pinnedClosureEntryCount: 0,
+    pinnedClosureEstimatedTokens: 0,
+    protectedInteractionCount: 0,
+    replayedMessageCount: 0,
+    maxReplayCascadeDepth: 0,
+  };
+}
+
 /**
  * Final M6 projection engine. It only replaces complete, fully visible,
  * protocol-valid task subtrees. Every ambiguity retains the original region.
@@ -165,7 +210,12 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
   plan(input: ProjectionInput): ProjectionPlan {
     const candidates = projectionCandidates(input.state);
     if (candidates.length === 0) {
-      return { messages: input.messages, projectedTaskIds: [], rejections: [] };
+      return {
+        messages: input.messages,
+        projectedTaskIds: [],
+        rejections: [],
+        metrics: baseMetrics(input.messages, input.messages),
+      };
     }
 
     const records = contextMessageRecords(input.contextEntries);
@@ -177,6 +227,7 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
           taskId: task.id,
           reasons: ["incoming provider context does not align with active Pi context entries; retained subtree"],
         })),
+        metrics: baseMetrics(input.messages, input.messages),
       };
     }
 
@@ -279,6 +330,8 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
       }
 
       const survivorMessages: SurvivorMessage[] = [];
+      const pinnedClosureEntryIds = new Set<string>();
+      let protectedInteractionCount = 0;
       let survivorOrder = 0;
       const addSurvivor = (entryId: string, position: number): void => {
         const entryPosition = branchPosition.get(entryId);
@@ -338,6 +391,7 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
             reasons.push(`pinned output ${output.id} closure escapes the candidate task range`);
             continue;
           }
+          pinnedClosureEntryIds.add(item.entryId);
           addSurvivor(item.entryId, position);
         }
       }
@@ -346,6 +400,7 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
         if (!descendantSet.has(interaction.taskId)) continue;
         try {
           const protectedInteraction = interactions.resolveInteraction(interaction);
+          protectedInteractionCount += 1;
           for (const occurrence of protectedInteraction.userOccurrences) {
             addSurvivor(occurrence.entryId, occurrence.occurrencePosition);
           }
@@ -401,12 +456,17 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
         endMessageIndex: messageIndexes.at(-1)! + 1,
         replacement,
         projectedTaskIds: descendants,
+        pinnedClosureEntryIds: [...pinnedClosureEntryIds],
+        protectedInteractionCount,
+        replayedMessageCount: unanswered.length,
+        maxReplayCascadeDepth: Math.max(0, ...unanswered.map((item) => item.cascadeDepth)),
       });
     }
 
     projections.sort((left, right) => right.startMessageIndex - left.startMessageIndex);
     const messages = [...input.messages];
     const projectedTaskIds: TaskId[] = [];
+    const acceptedProjections: CandidateProjection[] = [];
     let previousStart = Number.POSITIVE_INFINITY;
     for (const projection of projections) {
       if (projection.endMessageIndex > previousStart) {
@@ -422,13 +482,47 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
         ...projection.replacement,
       );
       projectedTaskIds.push(...projection.projectedTaskIds);
+      acceptedProjections.push(projection);
       previousStart = projection.startMessageIndex;
     }
+
+    const metrics = baseMetrics(input.messages, messages);
+    metrics.projectedRawMessageCount = acceptedProjections.reduce(
+      (total, projection) => total + projection.endMessageIndex - projection.startMessageIndex,
+      0,
+    );
+    const pinnedEntryIds = new Set(
+      acceptedProjections.flatMap((projection) => projection.pinnedClosureEntryIds),
+    );
+    metrics.pinnedClosureEntryCount = pinnedEntryIds.size;
+    metrics.pinnedClosureEstimatedTokens = [...pinnedEntryIds].reduce((total, entryId) => {
+      const position = branchPosition.get(entryId);
+      const entry = position === undefined ? undefined : input.branchEntries[position];
+      return entry
+        ? total + sessionEntryToContextMessages(entry).reduce(
+            (entryTotal, message) => entryTotal + estimateTokens(message),
+            0,
+          )
+        : total;
+    }, 0);
+    metrics.protectedInteractionCount = acceptedProjections.reduce(
+      (total, projection) => total + projection.protectedInteractionCount,
+      0,
+    );
+    metrics.replayedMessageCount = acceptedProjections.reduce(
+      (total, projection) => total + projection.replayedMessageCount,
+      0,
+    );
+    metrics.maxReplayCascadeDepth = Math.max(
+      0,
+      ...acceptedProjections.map((projection) => projection.maxReplayCascadeDepth),
+    );
 
     return {
       messages,
       projectedTaskIds: [...new Set(projectedTaskIds)],
       rejections,
+      metrics,
     };
   }
 }
@@ -443,6 +537,7 @@ export class RetainingProjectionPlanner implements ProjectionPlanner {
         taskId: task.id,
         reasons: ["retaining projection planner selected; retained subtree"],
       })),
+      metrics: baseMetrics(input.messages, input.messages),
     };
   }
 }

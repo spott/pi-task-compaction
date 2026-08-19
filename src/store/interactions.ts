@@ -17,6 +17,8 @@ export interface PendingUserMessage {
   sourcePosition: number;
   occurrencePosition: number;
   order: number;
+  /** Number of task closures through which this unanswered input is replayed. */
+  cascadeDepth: number;
 }
 
 export interface ResolvedProtectedInteraction {
@@ -222,6 +224,7 @@ export class InteractionIndex {
         sourcePosition: position,
         occurrencePosition: position,
         order: 0,
+        cascadeDepth: 1,
       });
     }
 
@@ -243,6 +246,7 @@ export class InteractionIndex {
           ...item,
           occurrencePosition: childBounds.end - 0.25 + (index + 1) / (divisor * 10),
           order: index,
+          cascadeDepth: item.cascadeDepth + 1,
         });
       });
     }

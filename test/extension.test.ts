@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "vitest";
 import taskFrameworkExtension from "../extensions/task-framework.js";
 import { CONFIG_FLAGS, type Config } from "../src/config.js";
+import { EVALUATION_TELEMETRY_CUSTOM_TYPE } from "../src/evaluation/telemetry.js";
 import { taskFrameworkGuidance } from "../src/guidance.js";
 import { TASK_EVENT_CUSTOM_TYPE } from "../src/model/events.js";
 import { registerTaskFramework, stripUnretainedSummaries } from "../src/task-framework.js";
@@ -380,6 +381,18 @@ describe("Pi task extension integration", () => {
     expect(transformed.messages.at(-1)).toMatchObject({ role: "user", content: "Replay through hook" });
     expect(services.projection.lastPlan?.projectedTaskIds).toEqual([taskId]);
     expect(services.projection.rejectionCounts.size).toBe(0);
+    const telemetry = manager.getBranch().find(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === EVALUATION_TELEMETRY_CUSTOM_TYPE &&
+        (entry.data as any).kind === "context_projection",
+    );
+    expect((telemetry as any)?.data).toMatchObject({
+      schemaVersion: 1,
+      sessionId: manager.getSessionId(),
+      projectedTaskIds: [taskId],
+      metrics: { replayedMessageCount: 1, maxReplayCascadeDepth: 1 },
+    });
   });
 
   it("routes manual, threshold, and overflow compaction through the task-aware compactor", async () => {
@@ -437,6 +450,23 @@ describe("Pi task extension integration", () => {
     }
     expect(calls).toEqual(["manual", "threshold", "overflow"]);
     expect(services.projection.lastGlobalCompaction?.cancelledReason).toBe("fixture overflow");
+    const telemetry = manager.getBranch().filter(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === EVALUATION_TELEMETRY_CUSTOM_TYPE &&
+        (entry.data as any).kind === "global_compaction",
+    );
+    expect(telemetry.map((entry) => (entry as any).data.reason)).toEqual([
+      "manual",
+      "threshold",
+      "overflow",
+    ]);
+    expect((telemetry.at(-1) as any)?.data).toMatchObject({
+      cancelled: true,
+      cancelledReason: "fixture overflow",
+      willRetry: true,
+      tokensBefore: 100,
+    });
     expect(notifications).toEqual([
       "Task-aware compaction cancelled: fixture manual",
       "Task-aware compaction cancelled: fixture threshold",
