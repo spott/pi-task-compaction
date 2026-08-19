@@ -12,6 +12,11 @@ import { InteractionIndex, type PendingUserMessage } from "../store/interactions
 import type { TranscriptRange } from "../transcript/anchors.js";
 import { canonicalJson, hashToolCall, hashToolResult } from "../transcript/hash.js";
 import { SessionProtocolResolver } from "../transcript/protocol.js";
+import {
+  alignContextMessages,
+  type ContextAlignment,
+  type ContextMessageRecord,
+} from "./context-alignment.js";
 import { makeTaskSummaryMessage } from "./render.js";
 
 export interface ProjectionNode {
@@ -58,6 +63,8 @@ export interface ProjectionPlanMetrics {
   protectedInteractionCount: number;
   replayedMessageCount: number;
   maxReplayCascadeDepth: number;
+  contextAlignment: ContextAlignment["status"];
+  omittedRetryErrorEntryCount: number;
 }
 
 export interface ProjectionPlan {
@@ -77,12 +84,6 @@ export interface ProjectionInput {
 
 export interface ProjectionPlanner {
   plan(input: ProjectionInput): ProjectionPlan;
-}
-
-interface ContextMessageRecord {
-  entryId: string;
-  message: AgentMessage;
-  messageIndex: number;
 }
 
 interface SurvivorMessage {
@@ -106,21 +107,6 @@ interface CandidateProjection {
 
 export function chronologicalSurvivors(survivors: readonly Survivor[]): Survivor[] {
   return [...survivors].sort((left, right) => left.position - right.position);
-}
-
-function contextMessageRecords(entries: readonly SessionEntry[]): ContextMessageRecord[] {
-  const records: ContextMessageRecord[] = [];
-  for (const entry of entries) {
-    for (const message of sessionEntryToContextMessages(entry)) {
-      records.push({ entryId: entry.id, message, messageIndex: records.length });
-    }
-  }
-  return records;
-}
-
-function sameMessages(left: readonly AgentMessage[], right: readonly AgentMessage[]): boolean {
-  if (left.length !== right.length) return false;
-  return left.every((message, index) => canonicalJson(message) === canonicalJson(right[index]));
 }
 
 function subtreeIds(state: TaskRuntimeState, taskId: TaskId): TaskId[] {
@@ -185,7 +171,11 @@ function serializedBytes(messages: readonly AgentMessage[]): number {
   );
 }
 
-function baseMetrics(input: readonly AgentMessage[], output: readonly AgentMessage[]): ProjectionPlanMetrics {
+function baseMetrics(
+  input: readonly AgentMessage[],
+  output: readonly AgentMessage[],
+  alignment: ContextAlignment,
+): ProjectionPlanMetrics {
   return {
     inputMessageCount: input.length,
     outputMessageCount: output.length,
@@ -199,6 +189,8 @@ function baseMetrics(input: readonly AgentMessage[], output: readonly AgentMessa
     protectedInteractionCount: 0,
     replayedMessageCount: 0,
     maxReplayCascadeDepth: 0,
+    contextAlignment: alignment.status,
+    omittedRetryErrorEntryCount: alignment.omittedRetryErrorEntryIds.length,
   };
 }
 
@@ -208,33 +200,42 @@ function baseMetrics(input: readonly AgentMessage[], output: readonly AgentMessa
  */
 export class LocalProjectionPlanner implements ProjectionPlanner {
   plan(input: ProjectionInput): ProjectionPlan {
+    const alignment = alignContextMessages(input.messages, input.contextEntries);
     const candidates = projectionCandidates(input.state);
     if (candidates.length === 0) {
       return {
         messages: input.messages,
         projectedTaskIds: [],
         rejections: [],
-        metrics: baseMetrics(input.messages, input.messages),
+        metrics: baseMetrics(input.messages, input.messages, alignment),
       };
     }
 
-    const records = contextMessageRecords(input.contextEntries);
-    if (!sameMessages(input.messages, records.map((record) => record.message))) {
+    if (alignment.status === "mismatch") {
+      const location = alignment.mismatch
+        ? ` (${alignment.mismatch.reason} at live message index ${alignment.mismatch.liveMessageIndex}, context record index ${alignment.mismatch.contextRecordIndex})`
+        : "";
+      const recognizedOmissions = alignment.omittedRetryErrorEntryIds.length > 0
+        ? ` after ${alignment.omittedRetryErrorEntryIds.length} eligible retry-error omission(s)`
+        : "";
       return {
         messages: input.messages,
         projectedTaskIds: [],
         rejections: candidates.map((task) => ({
           taskId: task.id,
-          reasons: ["incoming provider context does not align with active Pi context entries; retained subtree"],
+          reasons: [`incoming provider context does not align with active Pi context entries${location}${recognizedOmissions}; retained subtree`],
         })),
-        metrics: baseMetrics(input.messages, input.messages),
+        metrics: baseMetrics(input.messages, input.messages, alignment),
       };
     }
+
+    const records = alignment.records;
 
     const resolver = new SessionProtocolResolver(input.sessionId, input.branchEntries);
     const interactions = new InteractionIndex(input.state, input.sessionId, input.branchEntries);
     const branchPosition = new Map(input.branchEntries.map((entry, index) => [entry.id, index]));
     const contextByEntry = new Map(records.map((record) => [record.entryId, record]));
+    const omittedRetryErrorEntryIds = new Set(alignment.omittedRetryErrorEntryIds);
     const projections: CandidateProjection[] = [];
     const rejections: ProjectionRejection[] = [];
 
@@ -334,6 +335,10 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
       let protectedInteractionCount = 0;
       let survivorOrder = 0;
       const addSurvivor = (entryId: string, position: number): void => {
+        if (omittedRetryErrorEntryIds.has(entryId)) {
+          reasons.push(`survivor entry ${entryId} was omitted from live provider context after a retry error`);
+          return;
+        }
         const entryPosition = branchPosition.get(entryId);
         const entry = entryPosition === undefined ? undefined : input.branchEntries[entryPosition];
         if (!entry) {
@@ -486,7 +491,7 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
       previousStart = projection.startMessageIndex;
     }
 
-    const metrics = baseMetrics(input.messages, messages);
+    const metrics = baseMetrics(input.messages, messages, alignment);
     metrics.projectedRawMessageCount = acceptedProjections.reduce(
       (total, projection) => total + projection.endMessageIndex - projection.startMessageIndex,
       0,
@@ -530,6 +535,7 @@ export class LocalProjectionPlanner implements ProjectionPlanner {
 /** Explicit safe fallback used by tests and non-production diagnostic callers. */
 export class RetainingProjectionPlanner implements ProjectionPlanner {
   plan(input: ProjectionInput): ProjectionPlan {
+    const alignment = alignContextMessages(input.messages, input.contextEntries);
     return {
       messages: input.messages,
       projectedTaskIds: [],
@@ -537,7 +543,7 @@ export class RetainingProjectionPlanner implements ProjectionPlanner {
         taskId: task.id,
         reasons: ["retaining projection planner selected; retained subtree"],
       })),
-      metrics: baseMetrics(input.messages, input.messages),
+      metrics: baseMetrics(input.messages, input.messages, alignment),
     };
   }
 }

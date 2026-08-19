@@ -69,6 +69,14 @@ function assistant(
   };
 }
 
+function retryError(text: string): AssistantMessage {
+  return {
+    ...assistant([], text),
+    stopReason: "error",
+    errorMessage: "transient provider error",
+  };
+}
+
 function result(id: string, name: string, text: string): ToolResultMessage {
   return {
     role: "toolResult",
@@ -392,6 +400,40 @@ describe("M11 task-aware global compaction", () => {
     expect(prompt).toContain("SUMMARIZE THIS");
     expect(prompt).toContain("already passed through the task projection planner");
     expect(prompt).not.toContain("KEEP THIS");
+  });
+
+  it("keeps a persisted assistant error when global-compaction inputs match exactly", async () => {
+    const f = fixture();
+    f.appendMessage(user("EXACT PREFIX"));
+    f.appendMessage(retryError("PERSISTENT ERROR FOR GLOBAL SUMMARY"));
+    const recentId = f.appendMessage(user("EXACT RECENT"));
+    const captured: GlobalSummaryRequest[] = [];
+    const plans: ReturnType<LocalProjectionPlanner["plan"]>[] = [];
+    const localPlanner = new LocalProjectionPlanner();
+    const planner = {
+      plan(input: Parameters<LocalProjectionPlanner["plan"]>[0]) {
+        const plan = localPlanner.plan(input);
+        plans.push(plan);
+        return plan;
+      },
+    };
+
+    const decision = await capturingCompactor(captured).compact(
+      event(f.manager, recentId),
+      planner,
+      { ctx: extensionContext(f.manager), state: f.runtime.snapshot },
+    );
+
+    expect(decision.compaction).toMatchObject({
+      firstKeptEntryId: recentId,
+      details: { alignment: "unchanged", projectedTaskIds: [] },
+    });
+    expect(plans).toHaveLength(2);
+    expect(plans.every((plan) =>
+      plan.metrics.contextAlignment === "exact" &&
+      plan.metrics.omittedRetryErrorEntryCount === 0
+    )).toBe(true);
+    expect(JSON.stringify(captured[0]?.messages)).toContain("PERSISTENT ERROR FOR GLOBAL SUMMARY");
   });
 
   it("passes the previous global summary and custom instructions to projected summarization", async () => {

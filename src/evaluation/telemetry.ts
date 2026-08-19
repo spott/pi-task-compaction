@@ -6,7 +6,7 @@ import type {
 import type { ProjectionPlan } from "../projection/planner.js";
 
 export const EVALUATION_TELEMETRY_CUSTOM_TYPE = "pi-task-framework/evaluation";
-export const EVALUATION_TELEMETRY_SCHEMA_VERSION = 1;
+export const EVALUATION_TELEMETRY_SCHEMA_VERSION = 2;
 
 interface EvaluationRecordBase {
   schemaVersion: typeof EVALUATION_TELEMETRY_SCHEMA_VERSION;

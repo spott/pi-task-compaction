@@ -10,7 +10,7 @@ import taskFrameworkExtension from "../extensions/task-framework.js";
 import { CONFIG_FLAGS, type Config } from "../src/config.js";
 import { EVALUATION_TELEMETRY_CUSTOM_TYPE } from "../src/evaluation/telemetry.js";
 import { taskFrameworkGuidance } from "../src/guidance.js";
-import { TASK_EVENT_CUSTOM_TYPE } from "../src/model/events.js";
+import { TASK_EVENT_CUSTOM_TYPE, taskEventEnvelope } from "../src/model/events.js";
 import { registerTaskFramework, stripUnretainedSummaries } from "../src/task-framework.js";
 
 interface Collector {
@@ -130,6 +130,15 @@ function assistant(toolCallId: string, name: string, args: Record<string, unknow
     },
     stopReason: "toolUse",
     timestamp: Date.now(),
+  };
+}
+
+function textAssistant(text: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+  return {
+    ...assistant("unused", "unused", {}),
+    content: [{ type: "text", text }],
+    stopReason,
+    ...(stopReason === "error" ? { errorMessage: "WebSocket error" } : {}),
   };
 }
 
@@ -408,8 +417,11 @@ describe("Pi task extension integration", () => {
       .execute("end-project", { task_id: taskId, ...summaryArgs }, undefined, undefined, ctx);
     expect(endResult.details.unanswered_message_count).toBe(1);
     manager.appendMessage(toolResult("end-project", "end_task", "closed"));
+    manager.appendMessage(textAssistant("PERSISTED RETRY ERROR", "error"));
 
-    const messages = manager.buildSessionContext().messages;
+    const messages = manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
     const transformed = await collected.handlers.get("context")![0]!
       ({ type: "context", messages }, ctx);
     expect(transformed.messages.filter((message: AgentMessage) => message.role === "custom")).toHaveLength(1);
@@ -428,11 +440,109 @@ describe("Pi task extension integration", () => {
         (entry.data as any).kind === "context_projection",
     );
     expect((telemetry as any)?.data).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId: manager.getSessionId(),
       projectedTaskIds: [taskId],
-      metrics: { replayedMessageCount: 1, maxReplayCascadeDepth: 1 },
+      metrics: {
+        replayedMessageCount: 1,
+        maxReplayCascadeDepth: 1,
+        contextAlignment: "retry_error_omissions",
+        omittedRetryErrorEntryCount: 1,
+      },
     });
+
+    const mismatchedMessages = [
+      ...manager.buildSessionContext().messages,
+      { role: "user", content: "FOREIGN MESSAGE", timestamp: Date.now() } as AgentMessage,
+    ];
+    const retained = await collected.handlers.get("context")![0]!(
+      { type: "context", messages: mismatchedMessages },
+      ctx,
+    );
+    expect(retained.messages).toBe(mismatchedMessages);
+    expect(services.projection.lastPlan?.metrics).toMatchObject({
+      contextAlignment: "mismatch",
+      omittedRetryErrorEntryCount: 0,
+    });
+    const telemetryRecords = manager.getBranch().filter(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === EVALUATION_TELEMETRY_CUSTOM_TYPE &&
+        (entry.data as any).kind === "context_projection",
+    );
+    expect((telemetryRecords.at(-1) as any)?.data).toMatchObject({
+      schemaVersion: 2,
+      projectedTaskIds: [],
+      metrics: { contextAlignment: "mismatch", omittedRetryErrorEntryCount: 0 },
+    });
+  });
+
+  it("reconciles retry history in a worker-owned session through the shared context hook", async () => {
+    const manager = SessionManager.inMemory("/tmp/task-framework-worker-retry-projection-test");
+    const taskId = "00000000-0000-4000-8000-000000000901";
+    const sessionId = manager.getSessionId();
+    manager.appendCustomEntry(TASK_EVENT_CUSTOM_TYPE, taskEventEnvelope({
+      type: "task_created",
+      at: Date.now(),
+      taskId,
+      task: "worker retry projection",
+      parentTaskId: null,
+      localDepth: 0,
+      execution: {
+        kind: "worker",
+        workerId: "worker-retry",
+        processId: "worker-retry",
+        sessionId,
+        agentDepth: 1,
+      },
+      transcript: {
+        sessionId,
+        beginAnchor: { sessionId, entryId: null, boundary: "before" },
+      },
+    }));
+    manager.appendCustomEntry(TASK_EVENT_CUSTOM_TYPE, taskEventEnvelope({
+      type: "task_started",
+      at: Date.now(),
+      taskId,
+    }));
+    manager.appendMessage(textAssistant("WORKER RAW BODY"));
+    const bodyEntryId = manager.getLeafId()!;
+    manager.appendCustomEntry(TASK_EVENT_CUSTOM_TYPE, taskEventEnvelope({
+      type: "task_completed",
+      at: Date.now(),
+      taskId,
+      endAnchor: { sessionId, entryId: bodyEntryId, boundary: "after" },
+      summary: summaryArgs,
+    }));
+    manager.appendMessage(textAssistant("WORKER PERSISTED RETRY ERROR", "error"));
+
+    const collected = collector((customType, data) => manager.appendCustomEntry(customType, data));
+    const services = registerTaskFramework(
+      collected.pi,
+      config({ tasks: true, summaries: true, compaction: true, agents: true }),
+    )!;
+    const { ctx } = context(manager);
+    await collected.handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+    const messages = manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
+
+    const transformed = await collected.handlers.get("context")![0]!(
+      { type: "context", messages },
+      ctx,
+    );
+
+    expect(services.runtime.snapshot.tasks.get(taskId)?.execution.kind).toBe("worker");
+    expect(services.projection.lastPlan).toMatchObject({
+      projectedTaskIds: [taskId],
+      metrics: {
+        contextAlignment: "retry_error_omissions",
+        omittedRetryErrorEntryCount: 1,
+      },
+    });
+    expect(JSON.stringify(transformed.messages)).toContain(taskId);
+    expect(JSON.stringify(transformed.messages)).not.toContain("WORKER RAW BODY");
+    expect(JSON.stringify(transformed.messages)).not.toContain("WORKER PERSISTED RETRY ERROR");
   });
 
   it("routes manual, threshold, and overflow compaction through the task-aware compactor", async () => {

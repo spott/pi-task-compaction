@@ -62,6 +62,17 @@ function assistant(
   };
 }
 
+function retryError(
+  text = "transient provider failure",
+  calls: Array<{ id: string; name: string; arguments?: Record<string, unknown> }> = [],
+): AssistantMessage {
+  return {
+    ...assistant(calls, text),
+    stopReason: "error",
+    errorMessage: "WebSocket error",
+  };
+}
+
 function result(id: string, name: string, text: string): ToolResultMessage {
   return {
     role: "toolResult",
@@ -134,17 +145,20 @@ function harness() {
     appendMessage(result(toolCallId, "respond_to_user", "protected"));
     return protectedResult;
   };
-  const project = (selectedRuntime = runtime) => {
-    const contextEntries = manager.buildContextEntries();
-    const messages = manager.buildSessionContext().messages;
-    return new LocalProjectionPlanner().plan({
-      messages,
-      sessionId: manager.getSessionId(),
-      branchEntries: manager.getBranch(),
-      contextEntries,
-      state: selectedRuntime.snapshot,
-    });
-  };
+  const projectMessages = (
+    messages: AgentMessage[],
+    selectedRuntime = runtime,
+    contextEntries = manager.buildContextEntries(),
+    branchEntries = manager.getBranch(),
+  ) => new LocalProjectionPlanner().plan({
+    messages,
+    sessionId: manager.getSessionId(),
+    branchEntries,
+    contextEntries,
+    state: selectedRuntime.snapshot,
+  });
+  const project = (selectedRuntime = runtime) =>
+    projectMessages(manager.buildSessionContext().messages, selectedRuntime);
   return {
     manager,
     runtime,
@@ -156,6 +170,7 @@ function harness() {
     end,
     protect,
     project,
+    projectMessages,
   };
 }
 
@@ -461,6 +476,142 @@ describe("M6 local task projection", () => {
     expect(projected.rejections).toHaveLength(1);
     expect(userTexts(projected.messages)).toEqual(["VISIBLE ORIGINAL"]);
     expect(summaryMessages(projected.messages)).toHaveLength(0);
+  });
+
+  it("projects tasks on both sides of an omitted retry error with actual live indexes", () => {
+    const fixture = harness();
+    const before = fixture.begin("before retry");
+    fixture.appendMessage(assistant([], "BEFORE RETRY RAW BODY"));
+    fixture.end(before.task_id);
+    fixture.appendMessage(retryError("OMITTED TRANSIENT ERROR"));
+    fixture.appendMessage(user("VISIBLE BETWEEN TASKS"));
+    const after = fixture.begin("after retry");
+    fixture.appendMessage(assistant([], "AFTER RETRY RAW BODY"));
+    fixture.end(after.task_id);
+
+    const contextEntries = fixture.manager.buildContextEntries();
+    const branchEntries = fixture.manager.getBranch();
+    const liveMessages = fixture.manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
+    const contextSnapshot = structuredClone(contextEntries);
+    const branchSnapshot = structuredClone(branchEntries);
+    const liveSnapshot = structuredClone(liveMessages);
+
+    const first = fixture.projectMessages(
+      liveMessages,
+      fixture.runtime,
+      contextEntries,
+      branchEntries,
+    );
+    const second = fixture.projectMessages(liveMessages);
+
+    expect(new Set(first.projectedTaskIds)).toEqual(new Set([before.task_id, after.task_id]));
+    expect(first.rejections).toEqual([]);
+    expect(first.metrics).toMatchObject({
+      contextAlignment: "retry_error_omissions",
+      omittedRetryErrorEntryCount: 1,
+    });
+    expect(summaryMessages(first.messages)).toHaveLength(2);
+    expect(userTexts(first.messages)).toEqual(["VISIBLE BETWEEN TASKS"]);
+    expect(JSON.stringify(first.messages)).not.toContain("BEFORE RETRY RAW BODY");
+    expect(JSON.stringify(first.messages)).not.toContain("AFTER RETRY RAW BODY");
+    expect(JSON.stringify(first.messages)).not.toContain("OMITTED TRANSIENT ERROR");
+    expect(second.messages).toEqual(first.messages);
+    expect(second.projectedTaskIds).toEqual(first.projectedTaskIds);
+    expect(contextEntries).toEqual(contextSnapshot);
+    expect(branchEntries).toEqual(branchSnapshot);
+    expect(liveMessages).toEqual(liveSnapshot);
+  });
+
+  it("retains a task spanning an omitted partial-thinking and tool-call error", () => {
+    const fixture = harness();
+    const task = fixture.begin("spans retry error");
+    fixture.appendMessage(assistant([], "VISIBLE RAW PREFIX"));
+    const error = retryError("PARTIAL ERROR TEXT", [
+      { id: "partial-call", name: "read", arguments: { path: "unfinished" } },
+    ]);
+    error.content.unshift({ type: "thinking", thinking: "PARTIAL PRIVATE THINKING" });
+    fixture.appendMessage(error);
+    fixture.appendMessage(assistant([], "VISIBLE RAW SUFFIX"));
+    fixture.end(task.task_id);
+    const liveMessages = fixture.manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
+
+    const projected = fixture.projectMessages(liveMessages);
+
+    expect(projected.projectedTaskIds).toEqual([]);
+    expect(projected.metrics).toMatchObject({
+      contextAlignment: "retry_error_omissions",
+      omittedRetryErrorEntryCount: 1,
+    });
+    expect(projected.rejections[0]).toMatchObject({
+      taskId: task.task_id,
+      reasons: expect.arrayContaining([
+        "task transcript is only partially visible after Pi context construction",
+      ]),
+    });
+    expect(projected.messages).toEqual(liveMessages);
+    expect(JSON.stringify(projected.messages)).toContain("VISIBLE RAW PREFIX");
+    expect(JSON.stringify(projected.messages)).toContain("VISIBLE RAW SUFFIX");
+    expect(JSON.stringify(projected.messages)).not.toContain("PARTIAL ERROR TEXT");
+    expect(JSON.stringify(projected.messages)).not.toContain("PARTIAL PRIVATE THINKING");
+    expect(JSON.stringify(projected.messages)).not.toContain("partial-call");
+  });
+
+  it("does not reconstruct an omitted retry-error entry to satisfy a pinned closure", () => {
+    const fixture = harness();
+    const task = fixture.begin("retry error pin safety");
+    const errorEntryId = fixture.appendMessage(retryError("OMITTED PIN SOURCE", [
+      { id: "retry-source", name: "read", arguments: { path: "partial" } },
+    ]));
+    fixture.appendMessage(result("retry-source", "read", "orphaned result"));
+    fixture.appendMessage(assistant([{ id: "pin-retry-source", name: "preserve_output" }]));
+    fixture.preservation.preserve(
+      { tool_call_id: "retry-source", pin: true },
+      "pin-retry-source",
+      fixture.manager,
+      fixture.append,
+    );
+    fixture.appendMessage(result("pin-retry-source", "preserve_output", "preserved"));
+    fixture.end(task.task_id);
+    const liveMessages = fixture.manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
+
+    const projected = fixture.projectMessages(liveMessages);
+
+    expect(projected.projectedTaskIds).toEqual([]);
+    expect(projected.rejections[0]?.reasons).toContain(
+      `survivor entry ${errorEntryId} was omitted from live provider context after a retry error`,
+    );
+    expect(projected.messages).toEqual(liveMessages);
+    expect(JSON.stringify(projected.messages)).not.toContain("OMITTED PIN SOURCE");
+  });
+
+  it("does not reconstruct an omitted retry-error entry to satisfy a protected interaction", () => {
+    const fixture = harness();
+    const task = fixture.begin("retry error interaction safety");
+    fixture.appendMessage(user("PROTECTED RETRY QUESTION"));
+    const errorEntryId = fixture.appendMessage(retryError("OMITTED RETRY ANSWER", [
+      { id: "retry-response", name: "respond_to_user" },
+    ]));
+    fixture.interactions.protect("retry-response", fixture.manager, fixture.append);
+    fixture.appendMessage(result("retry-response", "respond_to_user", "protected"));
+    fixture.end(task.task_id);
+    const liveMessages = fixture.manager.buildSessionContext().messages.filter(
+      (message) => message.role !== "assistant" || message.stopReason !== "error",
+    );
+
+    const projected = fixture.projectMessages(liveMessages);
+
+    expect(projected.projectedTaskIds).toEqual([]);
+    expect(projected.rejections[0]?.reasons).toContain(
+      `survivor entry ${errorEntryId} was omitted from live provider context after a retry error`,
+    );
+    expect(projected.messages).toEqual(liveMessages);
+    expect(JSON.stringify(projected.messages)).not.toContain("OMITTED RETRY ANSWER");
   });
 
   it("retains every candidate when incoming context no longer aligns with Pi entries", () => {

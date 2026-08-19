@@ -8,7 +8,7 @@ import { chronologicalSurvivors, RetainingProjectionPlanner } from "../src/proje
 describe("M1 projection contract", () => {
   it("defines every required safety fixture with a unique invariant", () => {
     expect(() => assertProjectionFixtureCorpus()).not.toThrow();
-    expect(PROJECTION_FIXTURE_CORPUS).toHaveLength(27);
+    expect(PROJECTION_FIXTURE_CORPUS).toHaveLength(28);
     expect(PROJECTION_FIXTURE_CORPUS.map((fixture) => fixture.name)).toEqual(
       expect.arrayContaining([
         "interleaved pin protection pin",
@@ -16,6 +16,7 @@ describe("M1 projection contract", () => {
         "two-level replay cascade",
         "unknown framework event",
         "provider switch within session",
+        "retry error persisted but absent from live context",
       ]),
     );
   });

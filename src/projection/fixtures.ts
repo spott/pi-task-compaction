@@ -8,6 +8,7 @@ export type ProjectionFixtureCapability =
   | "protection"
   | "replay"
   | "ablation"
+  | "retries"
   | "compatibility";
 
 export interface ProjectionFixtureContract {
@@ -47,6 +48,7 @@ export const PROJECTION_FIXTURE_CORPUS: readonly ProjectionFixtureContract[] = [
   { name: "summaries-disabled closure", capabilities: ["ablation"], expectedInvariant: "authored summary is absent on next model turn" },
   { name: "unknown framework event", capabilities: ["ambiguity", "compatibility"], expectedInvariant: "unknown version is retained and not compacted" },
   { name: "adjacent branch and compaction summaries", capabilities: ["compatibility"], expectedInvariant: "framework range does not consume Pi summaries" },
+  { name: "retry error persisted but absent from live context", capabilities: ["retries", "ambiguity", "compatibility"], expectedInvariant: "recognized retry history may be absent without weakening protocol validation" },
   { name: "provider switch within session", capabilities: ["compatibility"], expectedInvariant: "projected protocol serializes for the active provider" },
 ] as const;
 
