@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerConfigFlags, resolveConfig } from "../src/config.js";
 import { registerTaskFramework } from "../src/task-framework.js";
-import { FileRunRegistry } from "../src/store/run-registry.js";
+import { FileRunRegistry, openOrCreateRunRegistry } from "../src/store/run-registry.js";
 import { loadWorkerBootstrap } from "../src/workers/bootstrap.js";
 
 /**
@@ -19,10 +19,25 @@ export default function taskFrameworkExtension(pi: ExtensionAPI): void {
     if (bootstrap && !config.features.agents) {
       throw new Error("Worker bootstrap requires features.agents=true");
     }
-    const registry = bootstrap ? await FileRunRegistry.open(bootstrap.runDirectory) : undefined;
+    const registry = config.features.agents
+      ? bootstrap
+        ? await FileRunRegistry.open(bootstrap.runDirectory)
+        : await openOrCreateRunRegistry(pi, ctx.sessionManager)
+      : undefined;
+    if (bootstrap && registry?.runId !== bootstrap.runId) {
+      throw new Error(`Worker bootstrap run ${bootstrap.runId} does not match registry ${registry?.runId}`);
+    }
     const services = registerTaskFramework(pi, config, {
       registerSessionStart: false,
-      ...(bootstrap && registry ? { worker: { bootstrap, registry } } : {}),
+      ...(registry
+        ? {
+            agents: {
+              registry,
+              localSessionId: ctx.sessionManager.getSessionId(),
+              ...(bootstrap ? { bootstrap } : {}),
+            },
+          }
+        : {}),
     });
     initialized = true;
     services?.ensureLoaded(ctx);

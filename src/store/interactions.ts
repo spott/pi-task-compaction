@@ -46,6 +46,23 @@ function messageEntry(entry: SessionEntry | undefined): UserMessage | undefined 
   return entry.message as UserMessage;
 }
 
+function userText(message: UserMessage): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .filter((block): block is Extract<(typeof message.content)[number], { type: "text" }> => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function isAssignedWorkerPrompt(task: Task, message: UserMessage): boolean {
+  if (task.localDepth !== 0 || task.execution.kind !== "worker") return false;
+  const text = userText(message);
+  return (
+    text.startsWith("You are an asynchronous task worker in a shared working tree.\n") &&
+    text.includes(`Assigned task ID: ${task.id}\nTask: ${task.task}\n`)
+  );
+}
+
 function anchorForEntry(sessionId: string, entryId: string): TranscriptAnchor {
   return { sessionId, entryId, boundary: "before" };
 }
@@ -126,9 +143,11 @@ export class InteractionIndex {
       }
     }
 
+    const tasksWithOwnedUserInput = new Set<TaskId>();
     for (let index = 0; index < this.entries.length; index += 1) {
       const entry = this.entries[index]!;
-      if (!messageEntry(entry)) continue;
+      const user = messageEntry(entry);
+      if (!user) continue;
       const owners = [...this.boundsByTask].flatMap(([taskId, bounds]) => {
         if (index < bounds.start || index >= bounds.end) return [];
         const task = this.state.tasks.get(taskId);
@@ -138,8 +157,16 @@ export class InteractionIndex {
         const depth = this.semanticDepth(right.task) - this.semanticDepth(left.task);
         return depth !== 0 ? depth : right.bounds.start - left.bounds.start;
       });
-      const owner = owners[0]?.task.id;
-      if (owner) this.ownerByUserEntry.set(entry.id, owner);
+      const owner = owners[0]?.task;
+      if (!owner) continue;
+      // The initial worker delegation prompt starts execution; it is not a user
+      // interruption and must disappear with the assigned root rather than replay.
+      if (!tasksWithOwnedUserInput.has(owner.id) && isAssignedWorkerPrompt(owner, user)) {
+        tasksWithOwnedUserInput.add(owner.id);
+        continue;
+      }
+      tasksWithOwnedUserInput.add(owner.id);
+      this.ownerByUserEntry.set(entry.id, owner.id);
     }
   }
 

@@ -473,6 +473,7 @@ export class LocalTaskRuntime {
     private readonly processId: string = randomUUID(),
     private readonly createId: () => string = randomUUID,
     private readonly now: () => number = Date.now,
+    private readonly currentAgentDepth = 0,
   ) {}
 
   get snapshot(): TaskRuntimeState {
@@ -481,6 +482,10 @@ export class LocalTaskRuntime {
 
   reconstruct(log: TaskEventLog): void {
     this.state = reconstructTaskState(log);
+  }
+
+  reconstructEntries(entries: readonly SessionEntry[]): void {
+    this.state = reconstructTaskStateFromEntries(entries);
   }
 
   reconstructFrom(store: TaskEventStore, sessionManager: ReadonlySessionManager): void {
@@ -710,7 +715,7 @@ export class LocalTaskRuntime {
           status: task.status,
           localDepth: task.localDepth,
           semanticDepth: semanticDepth(task),
-          agentDepth: task.execution.kind === "worker" ? task.execution.agentDepth : 0,
+          agentDepth: task.execution.kind === "worker" ? task.execution.agentDepth : this.currentAgentDepth,
           children,
           preservedOutputCount: task.preservedOutputs.length,
           pinnedOutputCount,

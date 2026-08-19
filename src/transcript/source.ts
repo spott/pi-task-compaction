@@ -18,7 +18,7 @@ export interface TranscriptResolver {
   resolveEntries(range: TranscriptRange): SessionEntry[];
 }
 
-/** Active-session implementation. Worker routing can supply another source in M8. */
+/** Resolve one already-selected owning session; worker routing selects external sources above this boundary. */
 export class SessionTranscriptResolver implements TranscriptResolver {
   constructor(
     private readonly sessionId: string,

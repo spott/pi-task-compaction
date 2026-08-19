@@ -412,7 +412,7 @@ describe("task inspection", () => {
     ).rejects.toThrow("belongs to view list, not search");
 
     const decoded = JSON.parse(Buffer.from(firstCursor!, "base64url").toString("utf8"));
-    decoded.requestFingerprint = `0${decoded.requestFingerprint.slice(1)}`;
+    decoded.requestFingerprint = `${decoded.requestFingerprint.startsWith("0") ? "1" : "0"}${decoded.requestFingerprint.slice(1)}`;
     const tampered = Buffer.from(JSON.stringify(decoded), "utf8").toString("base64url");
     await expect(
       fixture.inspector.inspect(

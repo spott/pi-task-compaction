@@ -64,6 +64,8 @@ const taskTools = [
   "respond_to_user",
 ] as const;
 
+const agentTools = ["spawn_task", "poll_task", "join_tasks"] as const;
+
 const arms = [
   {
     name: "vanilla",
@@ -84,6 +86,12 @@ const arms = [
     hooks: ["session_start", "session_tree", "turn_end"],
   },
   {
+    name: "agents without summaries",
+    features: { tasks: true, summaries: false, compaction: false, agents: true },
+    tools: [...taskTools, ...agentTools],
+    hooks: ["context", "session_start", "session_tree", "turn_end"],
+  },
+  {
     name: "tasks summaries compaction",
     features: { tasks: true, summaries: true, compaction: true, agents: false },
     tools: taskTools,
@@ -92,13 +100,13 @@ const arms = [
   {
     name: "tasks summaries agents",
     features: { tasks: true, summaries: true, compaction: false, agents: true },
-    tools: taskTools,
+    tools: [...taskTools, ...agentTools],
     hooks: ["session_start", "session_tree", "turn_end"],
   },
   {
     name: "full",
     features: { tasks: true, summaries: true, compaction: true, agents: true },
-    tools: taskTools,
+    tools: [...taskTools, ...agentTools],
     hooks: ["context", "session_before_compact", "session_start", "session_tree", "turn_end"],
   },
 ] as const;

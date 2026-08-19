@@ -234,7 +234,7 @@ export class PreservationService {
     if (!output) throw new Error(`Preserved output not found on the active task tree: ${outputId}`);
     if (output.source.sessionId !== sessionManager.getSessionId()) {
       throw new Error(
-        `Preserved output ${outputId} belongs to session ${output.source.sessionId}; worker routing is not available yet`,
+        `Preserved output ${outputId} belongs to session ${output.source.sessionId}; read it through its owning task source`,
       );
     }
     const unit = this.validate(output, this.resolver(sessionManager));

@@ -3,11 +3,19 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TaskId } from "../model/task.js";
 import type { RunId, WorkerId, WorkerRoute } from "../model/worker.js";
 import type { TaskSource } from "../transcript/source.js";
 
 const RUN_SCHEMA_VERSION = 1;
+export const RUN_CONTEXT_CUSTOM_TYPE = "pi-task-framework/run-context";
+
+interface RunContextRecord {
+  schemaVersion: typeof RUN_SCHEMA_VERSION;
+  runId: RunId;
+  directory: string;
+}
 const LOCK_RETRY_MS = 5;
 const LOCK_ATTEMPTS = 1_000;
 
@@ -131,6 +139,44 @@ export interface FileRunRegistryCreateOptions {
   root?: string;
   runId?: RunId;
   now?: () => number;
+}
+
+/** Reuse the branch-local run registry on resume/fork, or persist a new reference. */
+export async function openOrCreateRunRegistry(
+  pi: Pick<ExtensionAPI, "appendEntry">,
+  sessionManager: ExtensionContext["sessionManager"],
+): Promise<FileRunRegistry> {
+  const records = sessionManager.getBranch().flatMap((entry) => {
+    if (entry.type !== "custom" || entry.customType !== RUN_CONTEXT_CUSTOM_TYPE) return [];
+    const value = entry.data as Partial<RunContextRecord>;
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      value.schemaVersion !== RUN_SCHEMA_VERSION ||
+      typeof value.runId !== "string" ||
+      value.runId === "" ||
+      typeof value.directory !== "string" ||
+      value.directory === ""
+    ) {
+      throw new Error(`Malformed task-framework run context at entry ${entry.id}`);
+    }
+    return [value as RunContextRecord];
+  });
+  const unique = new Map(records.map((record) => [record.runId, record]));
+  if (unique.size > 1) throw new Error("Active branch contains multiple task-framework run contexts");
+  const existing = [...unique.values()][0];
+  if (existing) return FileRunRegistry.open(existing.directory);
+
+  const registry = await FileRunRegistry.create();
+  pi.appendEntry(RUN_CONTEXT_CUSTOM_TYPE, {
+    schemaVersion: RUN_SCHEMA_VERSION,
+    runId: registry.runId,
+    directory: registry.directory,
+  } satisfies RunContextRecord);
+  if (sessionManager.getLeafId() === null) {
+    throw new Error("Pi did not persist the task-framework run context");
+  }
+  return registry;
 }
 
 /** Private, process-independent routing/liveness registry with atomic run-wide leases. */

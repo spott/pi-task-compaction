@@ -7,11 +7,18 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Config } from "./config.js";
-import { LocalTaskInspector } from "./inspect/inspect.js";
+import { LocalTaskInspector, type InspectTaskRequest, type InspectTaskResult } from "./inspect/inspect.js";
+import type { TaskId, TaskListItem } from "./model/task.js";
 import type { TaskSummary } from "./model/summary.js";
 import type { RunRegistry } from "./store/run-registry.js";
 import type { WorkerBootstrap } from "./workers/bootstrap.js";
-import { WorkerTaskRouter } from "./workers/coordinator.js";
+import {
+  AsyncWorkerCoordinator,
+  WorkerTaskRouter,
+  spawnExecutionContext,
+} from "./workers/coordinator.js";
+import type { WorkerProcessLauncher } from "./workers/process.js";
+import { readWorkerTaskSource } from "./workers/source.js";
 import { LocalProjectionPlanner, type ProjectionPlan } from "./projection/planner.js";
 import { resolveAndPersistTaskAnchors } from "./store/anchor-resolutions.js";
 import { resolveAndPersistInteractionAnchors } from "./store/interaction-resolutions.js";
@@ -22,6 +29,7 @@ import {
   LocalTaskRuntime,
   type ListTasksQuery,
   type TaskBoundaryContext,
+  type TaskRuntimeState,
 } from "./store/task-runtime.js";
 
 const BeginTaskParams = Type.Object(
@@ -89,6 +97,28 @@ const InspectTaskParams = Type.Object(
   { additionalProperties: false },
 );
 
+const SpawnTaskParams = Type.Object(
+  {
+    task: Type.String({ minLength: 1 }),
+    required_context: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+    available_context: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  },
+  { additionalProperties: false },
+);
+
+const PollTaskParams = Type.Object(
+  { task_id: Type.String({ minLength: 1 }) },
+  { additionalProperties: false },
+);
+
+const JoinTasksParams = Type.Object(
+  {
+    task_ids: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+    wait: Type.Optional(StringEnum(["all", "any"] as const)),
+  },
+  { additionalProperties: false },
+);
+
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
 export interface ProjectionDiagnostics {
@@ -103,10 +133,11 @@ export interface TaskFrameworkServices {
   interactions: InteractionService;
   projection: ProjectionDiagnostics;
   inspector: LocalTaskInspector;
-  worker?: {
-    bootstrap: WorkerBootstrap;
+  agents?: {
+    bootstrap?: WorkerBootstrap;
     registry: RunRegistry;
     router: WorkerTaskRouter;
+    coordinator: AsyncWorkerCoordinator;
   };
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
@@ -115,9 +146,12 @@ export interface TaskFrameworkServices {
 
 export interface RegisterTaskFrameworkOptions {
   registerSessionStart?: boolean;
-  worker?: {
-    bootstrap: WorkerBootstrap;
+  agents?: {
     registry: RunRegistry;
+    localSessionId: string;
+    bootstrap?: WorkerBootstrap;
+    launcher?: WorkerProcessLauncher;
+    extensionPath?: string;
   };
 }
 
@@ -188,13 +222,12 @@ function stripUnretainedSummaries(messages: AgentMessage[]): AgentMessage[] {
   });
 }
 
-function formatTasks(runtime: LocalTaskRuntime): string {
-  const items = runtime.list();
-  if (items.length === 0) return "No tasks on the active branch.";
+function formatTasks(items: readonly TaskListItem[], activeStack: readonly TaskId[]): string {
+  if (items.length === 0) return "No tasks on the visible task tree.";
   return items
     .map((item) => {
       const indent = "  ".repeat(Math.max(0, item.semanticDepth - 1));
-      const active = runtime.snapshot.activeStack.includes(item.id) ? " *" : "";
+      const active = activeStack.includes(item.id) ? " *" : "";
       return `${indent}- [${item.status}] ${item.id} ${item.task}${active}`;
     })
     .join("\n");
@@ -212,6 +245,85 @@ function updateStatus(runtime: LocalTaskRuntime, ctx: ExtensionContext): void {
   );
 }
 
+function stateAgentDepth(state: TaskRuntimeState): number {
+  for (const task of state.tasks.values()) {
+    if (task.localDepth === 0 && task.execution.kind === "worker") return task.execution.agentDepth;
+  }
+  return 0;
+}
+
+function statusMatches(item: TaskListItem, status: ListTasksQuery["status"]): boolean {
+  if (status === undefined || status === "all") return true;
+  if (status === "open") return item.status === "open" || item.status === "starting" || item.status === "running";
+  if (status === "failed") return item.status === "failed" || item.status === "derived_failed";
+  return item.status === status;
+}
+
+async function listVisibleTasks(
+  runtime: LocalTaskRuntime,
+  router: WorkerTaskRouter | undefined,
+  localSessionId: string,
+  query: ListTasksQuery = {},
+): Promise<TaskListItem[]> {
+  const items = new Map<TaskId, TaskListItem>(runtime.list().map((item) => [item.id, item]));
+  if (router) {
+    for (const resolved of await router.list()) {
+      const task = resolved.task;
+      if (task.transcript.sessionId === localSessionId || items.has(task.id)) continue;
+      const children = task.children.map((taskId) => ({
+        taskId,
+        task: resolved.state.childDescriptions.get(taskId) ?? "(unresolved task)",
+      }));
+      const pinnedOutputCount = task.preservedOutputs.reduce(
+        (count, outputId) => count + (resolved.state.outputs.get(outputId)?.pin ? 1 : 0),
+        0,
+      );
+      items.set(task.id, {
+        id: task.id,
+        parentId: task.parentId,
+        task: task.task,
+        status: resolved.resolvedStatus,
+        localDepth: task.localDepth,
+        semanticDepth: 1,
+        agentDepth:
+          task.execution.kind === "worker" ? task.execution.agentDepth : stateAgentDepth(resolved.state),
+        children,
+        preservedOutputCount: task.preservedOutputs.length,
+        pinnedOutputCount,
+        execution: task.execution,
+      });
+    }
+  }
+
+  const semanticDepth = (item: TaskListItem): number => {
+    let depth = 1;
+    let parentId = item.parentId;
+    const seen = new Set<TaskId>([item.id]);
+    while (parentId !== null && !seen.has(parentId)) {
+      seen.add(parentId);
+      depth += 1;
+      parentId = items.get(parentId)?.parentId ?? null;
+    }
+    return depth;
+  };
+  for (const [id, item] of items) items.set(id, { ...item, semanticDepth: semanticDepth(item) });
+
+  let selected = [...items.values()];
+  if (query.root_task_id !== undefined) {
+    const root = items.get(query.root_task_id);
+    if (!root) throw new Error(`Unknown or invisible root task: ${query.root_task_id}`);
+    const ids = new Set<TaskId>();
+    const visit = (taskId: TaskId): void => {
+      if (ids.has(taskId)) return;
+      ids.add(taskId);
+      for (const child of items.get(taskId)?.children ?? []) visit(child.taskId);
+    };
+    visit(root.id);
+    selected = selected.filter((item) => ids.has(item.id));
+  }
+  return selected.filter((item) => statusMatches(item, query.status));
+}
+
 export function registerTaskFramework(
   pi: ExtensionAPI,
   config: Config,
@@ -220,20 +332,82 @@ export function registerTaskFramework(
   if (!config.features.tasks) return undefined;
 
   const store = new PiTaskEventStore(pi);
-  const runtime = new LocalTaskRuntime(config, randomUUID());
+  const runtime = new LocalTaskRuntime(
+    config,
+    randomUUID(),
+    randomUUID,
+    Date.now,
+    options.agents?.bootstrap?.agentDepth ?? 0,
+  );
   const preservation = new PreservationService(runtime);
   const interactions = new InteractionService(runtime);
   const planner = new LocalProjectionPlanner();
   const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
   const inspector = new LocalTaskInspector(runtime, { projection });
-  const worker = options.worker
-    ? {
-        ...options.worker,
-        router: new WorkerTaskRouter(options.worker.registry, options.worker.bootstrap.sessionId, options.worker.bootstrap),
-      }
+  const agents = options.agents
+    ? (() => {
+        const router = new WorkerTaskRouter(
+          options.agents.registry,
+          options.agents.localSessionId,
+          options.agents.bootstrap,
+        );
+        const coordinator = new AsyncWorkerCoordinator({
+          config,
+          registry: options.agents.registry,
+          runtime,
+          router,
+          ...(options.agents.bootstrap ? { bootstrap: options.agents.bootstrap } : {}),
+          ...(options.agents.launcher ? { launcher: options.agents.launcher } : {}),
+          ...(options.agents.extensionPath ? { extensionPath: options.agents.extensionPath } : {}),
+        });
+        return { ...options.agents, router, coordinator };
+      })()
     : undefined;
   let loadedSessionId: string | undefined;
   let workerStarted = false;
+
+  const inspectTask = async (
+    request: InspectTaskRequest,
+    ctx: ExtensionContext,
+  ): Promise<InspectTaskResult> => {
+    if (runtime.snapshot.tasks.has(request.task_id)) return inspector.inspect(request, ctx.sessionManager);
+    const resolved = await agents?.router.resolveVisibleTask(request.task_id);
+    if (!resolved) throw new Error(`Unknown or invisible task: ${request.task_id}`);
+    const source = readWorkerTaskSource(resolved.source.sessionFile, resolved.task.id);
+    const remoteRuntime = new LocalTaskRuntime(
+      config,
+      randomUUID(),
+      randomUUID,
+      Date.now,
+      stateAgentDepth(resolved.state),
+    );
+    remoteRuntime.reconstructEntries(source.manager.getBranch());
+    const result = await new LocalTaskInspector(remoteRuntime).inspect(request, source.manager);
+    if ((request.view ?? "summary") === "summary") {
+      result.details = { ...result.details, status: resolved.resolvedStatus };
+      result.text = JSON.stringify(result.details, null, 2);
+    }
+    return result;
+  };
+
+  const readPreservedOutput = async (
+    outputId: string,
+    ctx: ExtensionContext,
+  ) => {
+    if (runtime.snapshot.outputs.has(outputId)) return preservation.read(outputId, ctx.sessionManager);
+    const resolved = await agents?.router.resolveOutput(outputId);
+    if (!resolved) throw new Error(`Preserved output not found on the visible task tree: ${outputId}`);
+    const source = readWorkerTaskSource(resolved.task.source.sessionFile, resolved.task.task.id);
+    const remoteRuntime = new LocalTaskRuntime(
+      config,
+      randomUUID(),
+      randomUUID,
+      Date.now,
+      stateAgentDepth(resolved.task.state),
+    );
+    remoteRuntime.reconstructEntries(source.manager.getBranch());
+    return new PreservationService(remoteRuntime).read(outputId, source.manager);
+  };
 
   const reconstruct = (ctx: ExtensionContext): void => {
     runtime.reconstructFrom(store, ctx.sessionManager);
@@ -246,9 +420,9 @@ export function registerTaskFramework(
   const appendFrom = (ctx: ExtensionContext) => (event: Parameters<typeof store.append>[0]) =>
     store.append(event, ctx);
   const startWorker = async (ctx: ExtensionContext): Promise<void> => {
-    if (!worker || workerStarted) return;
+    if (!agents?.bootstrap || workerStarted) return;
     ensureLoaded(ctx);
-    const bootstrap = worker.bootstrap;
+    const bootstrap = agents.bootstrap;
     if (
       ctx.sessionManager.getSessionId() !== bootstrap.sessionId ||
       ctx.sessionManager.getSessionFile() !== bootstrap.sessionFile
@@ -256,7 +430,7 @@ export function registerTaskFramework(
       throw new Error(`Worker process did not adopt pre-created session ${bootstrap.sessionId}`);
     }
     runtime.adoptAssignedRoot(bootstrap.taskId, appendFrom(ctx));
-    await worker.registry.updateWorker(bootstrap.workerId, {
+    await agents.registry.updateWorker(bootstrap.workerId, {
       status: "running",
       pid: process.pid,
       startedAt: Date.now(),
@@ -271,10 +445,11 @@ export function registerTaskFramework(
       await startWorker(ctx);
     });
   }
-  if (worker) {
+  if (agents?.bootstrap) {
     pi.on("session_shutdown", async (_event, ctx) => {
       ensureLoaded(ctx);
-      const assigned = runtime.snapshot.tasks.get(worker.bootstrap.taskId);
+      const bootstrap = agents.bootstrap!;
+      const assigned = runtime.snapshot.tasks.get(bootstrap.taskId);
       if (assigned?.status === "open") {
         runtime.failOpenTasks(
           "Worker process shut down without completing its assigned root task",
@@ -283,8 +458,8 @@ export function registerTaskFramework(
           appendFrom(ctx),
         );
       }
-      const terminal = runtime.snapshot.tasks.get(worker.bootstrap.taskId);
-      await worker.registry.updateWorker(worker.bootstrap.workerId, {
+      const terminal = runtime.snapshot.tasks.get(bootstrap.taskId);
+      await agents.registry.updateWorker(bootstrap.workerId, {
         status: terminal?.status === "completed" ? "completed" : terminal?.status === "cancelled" ? "cancelled" : "failed",
         exitCode: terminal?.status === "completed" ? 0 : 1,
         exitedAt: Date.now(),
@@ -292,7 +467,7 @@ export function registerTaskFramework(
           ? {}
           : { diagnostics: terminal?.status === "failed" ? "Worker-owned task stream records failure" : "Worker exited without successful task completion" }),
       });
-      await worker.registry.releaseLease(worker.bootstrap.workerId);
+      await agents.registry.releaseLease(bootstrap.workerId);
     });
   }
   pi.on("session_tree", (_event, ctx) => reconstruct(ctx));
@@ -394,7 +569,7 @@ export function registerTaskFramework(
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       ensureLoaded(ctx);
-      const result = preservation.read(params.output_id, ctx.sessionManager);
+      const result = await readPreservedOutput(params.output_id, ctx);
       return {
         content: result.content,
         details: {
@@ -512,7 +687,7 @@ export function registerTaskFramework(
     executionMode: "sequential",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       ensureLoaded(ctx);
-      const result = await inspector.inspect(params, ctx.sessionManager);
+      const result = await inspectTask(params, ctx);
       return textResult(result.text, result.details);
     },
   });
@@ -530,7 +705,12 @@ export function registerTaskFramework(
         ...(params.root_task_id === undefined ? {} : { root_task_id: params.root_task_id }),
         ...(params.status === undefined ? {} : { status: params.status }),
       };
-      const tasks = runtime.list(query);
+      const tasks = await listVisibleTasks(
+        runtime,
+        agents?.router,
+        ctx.sessionManager.getSessionId(),
+        query,
+      );
       return textResult(JSON.stringify({ tasks, active_stack: runtime.snapshot.activeStack }, null, 2), {
         tasks,
         active_stack: [...runtime.snapshot.activeStack],
@@ -538,6 +718,80 @@ export function registerTaskFramework(
       });
     },
   });
+
+  if (config.features.agents) {
+    pi.registerTool({
+      name: "spawn_task",
+      label: "Spawn Task",
+      description:
+        "Start an independent semantic task in another Pi process and return immediately. The shared working tree is not isolated; spawn only work that is safe to run concurrently.",
+      promptSnippet: "Spawn an asynchronous worker task",
+      promptGuidelines: [
+        "Use spawn_task for genuinely independent work, with or without an active local task. Continue useful parent work while the worker runs.",
+        "Workers share the current working tree. Avoid concurrent conflicting edits; use required_context only for completed retained summaries and available_context for optional task references.",
+      ],
+      parameters: SpawnTaskParams,
+      executionMode: "sequential",
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        ensureLoaded(ctx);
+        if (!agents) throw new Error("Agent coordinator was not initialized for this session");
+        const result = await agents.coordinator.spawn(
+          {
+            task: params.task,
+            requiredContext: [...(params.required_context ?? [])],
+            availableContext: [...(params.available_context ?? [])],
+          },
+          spawnExecutionContext(ctx, appendFrom(ctx)),
+        );
+        const details = { task_id: result.taskId, status: result.status };
+        return textResult(`Spawned task ${result.taskId}; worker status is starting.`, details);
+      },
+    });
+
+    pi.registerTool({
+      name: "poll_task",
+      label: "Poll Task",
+      description: "Check one spawned worker task's compact lifecycle status without returning transcript content.",
+      promptSnippet: "Poll asynchronous worker status",
+      promptGuidelines: ["Poll sparingly; use join_tasks when worker results are actually needed."],
+      parameters: PollTaskParams,
+      executionMode: "parallel",
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        ensureLoaded(ctx);
+        if (!agents) throw new Error("Agent coordinator was not initialized for this session");
+        const result = await agents.coordinator.poll(params.task_id);
+        const details = {
+          task_id: result.task.id,
+          task: result.task.task,
+          status: result.lifecycleStatus,
+          semantic_status: result.semanticStatus,
+          resolved_status: result.resolvedStatus,
+          evidence: result.evidence,
+          ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+        };
+        return textResult(JSON.stringify(details, null, 2), details);
+      },
+    });
+
+    pi.registerTool({
+      name: "join_tasks",
+      label: "Join Tasks",
+      description:
+        "Wait for all requested workers (default) or the first terminal worker. Completed results include authoritative durable task summaries; failures retain their evidence source.",
+      promptSnippet: "Wait for asynchronous worker results",
+      promptGuidelines: [
+        "Join only when results are needed. wait=all does not cancel siblings after a failure; wait=any returns when the first requested task becomes terminal.",
+      ],
+      parameters: JoinTasksParams,
+      executionMode: "sequential",
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        ensureLoaded(ctx);
+        if (!agents) throw new Error("Agent coordinator was not initialized for this session");
+        const result = await agents.coordinator.join([...params.task_ids], params.wait ?? "all", signal);
+        return textResult(JSON.stringify(result, null, 2), result);
+      },
+    });
+  }
 
   pi.registerCommand("tasks", {
     description: "Show semantic tasks on the active branch",
@@ -555,12 +809,13 @@ export function registerTaskFramework(
         ctx.ui.notify("Usage: /tasks [open|completed|failed|cancelled|all]", "error");
         return;
       }
-      const output = status === "" || status === "all"
-        ? formatTasks(runtime)
-        : runtime
-            .list({ status })
-            .map((item) => `- [${item.status}] ${item.id} ${item.task}`)
-            .join("\n") || `No ${status} tasks.`;
+      const items = await listVisibleTasks(
+        runtime,
+        agents?.router,
+        ctx.sessionManager.getSessionId(),
+        status === "" || status === "all" ? {} : { status },
+      );
+      const output = formatTasks(items, runtime.snapshot.activeStack);
       ctx.ui.notify(output, "info");
     },
   });
@@ -572,7 +827,7 @@ export function registerTaskFramework(
     interactions,
     projection,
     inspector,
-    ...(worker ? { worker } : {}),
+    ...(agents ? { agents } : {}),
     reconstruct,
     ensureLoaded,
     startWorker,
