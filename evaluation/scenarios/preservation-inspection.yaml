@@ -1,0 +1,24 @@
+name: task-framework-preservation-inspection
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 8
+  - prompt:
+      text: |-
+        This is a read-only task-framework evaluation; do not modify files. Start one task to analyze
+        src/projection/planner.ts. Read enough of that file to identify its exported planner classes.
+        Preserve at least one completed ordinary read result with preserve_output(pin=false), record
+        the returned task/output identity, and close the task with a durable summary. Do not inspect
+        or recover the preserved content in this turn.
+  - checkpoint: preserved
+  - prompt:
+      text: |-
+        Recover the prior result through the framework rather than rereading the source. Use list_tasks
+        to locate the completed task, inspect_task(summary), inspect_task(search) for the literal
+        LocalProjectionPlanner, and read_preserved_output for the preserved result. Report the exported
+        planner class names and which inspection/recovery calls supplied the evidence. Do not modify files.
+  - checkpoint: recovered

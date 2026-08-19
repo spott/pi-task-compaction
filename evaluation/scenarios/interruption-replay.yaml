@@ -1,0 +1,28 @@
+name: task-framework-interruption-protection-and-replay
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 10
+  - prompt:
+      text: |-
+        Begin a read-only task auditing src/store/interactions.ts and read the relevant code. Keep the task
+        open. Before ending this turn, answer exactly "PHASE_READY" and mark that answer with
+        respond_to_user as the only tool call in its assistant message. Do not call end_task yet.
+  - checkpoint: protected-response
+  - prompt:
+      text: |-
+        INTERRUPTION_TOKEN=amber-orbit-27. Treat this as an interruption while the audit is active.
+        Do not call respond_to_user for this message. Finish the interactions audit and close the active
+        task with a summary, leaving this interruption unanswered so the framework must replay it after
+        task projection.
+  - checkpoint: task-closed-with-unanswered-input
+  - prompt:
+      text: |-
+        Confirm whether the replayed interruption is visible by returning its exact token. Use list_tasks
+        and inspect_task(summary) to report the completed audit task ID and its protected-interaction
+        count. Do not modify files.
+  - checkpoint: replay-observed

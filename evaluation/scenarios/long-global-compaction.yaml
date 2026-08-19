@@ -1,0 +1,41 @@
+name: task-framework-long-repeated-global-compaction
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 3600
+      max_model_turns: 20
+  - prompt:
+      text: |-
+        Read-only evaluation; do not modify files. Complete and close a task auditing semantic task/event
+        invariants in src/model/events.ts and src/store/task-runtime.ts. Cite symbols and verification gaps.
+  - compact:
+      custom_instructions: Retain task/event invariants and exact source paths for the continuing audit.
+  - prompt:
+      text: |-
+        Complete and close a new task auditing protocol and preservation integrity in
+        src/transcript/protocol.ts and src/store/preservation.ts. Connect findings to the prior audit summary.
+  - compact:
+      custom_instructions: Retain both completed audit conclusions and unresolved integrity risks.
+  - restart_pi: {}
+  - prompt:
+      text: |-
+        Complete and close a new task auditing interaction replay and local projection in
+        src/store/interactions.ts and src/projection/planner.ts. Use inspect_task on one prior task instead
+        of rereading its full source range.
+  - compact:
+      custom_instructions: Retain the three audit conclusions, inspection evidence, and remaining risks.
+  - prompt:
+      text: |-
+        Begin a final integration task. Audit worker/global-compaction boundaries in
+        src/workers/coordinator.ts and src/compaction/global.ts. Before closing it, synthesize how the four
+        subsystems preserve semantic authority and identify the highest-risk unresolved edge. Then close it.
+  - compact:
+      custom_instructions: Produce a concise final checkpoint across all four completed audits.
+  - prompt:
+      text: |-
+        Use list_tasks and bounded inspect_task views to report all four audit task IDs, their outcomes, and
+        whether repeated global compaction retained enough evidence for the final synthesis. Do not modify files.
+  - checkpoint: repeated-global-compaction-complete

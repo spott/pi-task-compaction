@@ -1,0 +1,24 @@
+name: task-framework-immutable-pin
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 8
+  - prompt:
+      text: |-
+        This is a read-only pinning evaluation. Begin one task, read README.md as an immutable reference,
+        preserve that completed read with preserve_output(pin=true), and close the task. In the task summary,
+        record the task ID, output ID, source tool-call ID, and the README's first Markdown heading. Do not
+        reread the file after preserving it.
+  - checkpoint: pinned-before-global-compaction
+  - compact:
+      custom_instructions: Preserve the task-framework evaluation facts needed to recover the pinned README reference.
+  - prompt:
+      text: |-
+        Without rereading README.md, inspect the completed task and recover the pinned output using
+        read_preserved_output. Report the exact first Markdown heading, whether the output is marked pinned,
+        and the retained closure entry count. Do not modify files.
+  - checkpoint: pin-recovered-after-global-compaction

@@ -1,5 +1,6 @@
 node_modules/
 coverage/
+evaluation/results/
 result
 result-*
 *.log

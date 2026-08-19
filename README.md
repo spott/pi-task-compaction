@@ -20,6 +20,8 @@ Workflow guidance is generated from the enabled feature set. Core task guidance 
 
 For evaluation, compaction-enabled context passes persist bounded, content-free `pi-task-framework/evaluation` records with raw/projected message, byte, and estimated-token counts; accepted pin/protection/replay counts; replay cascade depth; and rejection reasons. Successful and cancelled global-compaction decisions use the same telemetry stream. Semantic task/output/interaction records and private worker routing artifacts supply the remaining M13 measurements without exposing transcript bodies in telemetry.
 
+The checked-in [`evaluation/`](evaluation/README.md) suite defines the six primary and three diagnostic config-only ablation arms plus continuity workloads for near-64k context pressure, preservation/inspection, parallel agents, interruption replay, immutable pinning, worker-derived failure, and repeated global compaction. The sibling `pi-experiment-harness` captures coordinator and worker artifacts and emits the `task_framework` metric namespace. The summaries-disabled arm is retention-level: models still author the normal `end_task` schema.
+
 ## Configuration
 
 The extension reads `.pi/task-framework.json` by default. The full framework is enabled by default:

@@ -1,0 +1,26 @@
+name: task-framework-near-64k-context
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 12
+  - prompt:
+      text: |-
+        This is a deterministic context-pressure evaluation; do not modify files. Begin one task. Make six
+        separate bash tool calls. In call N (1 through 6), run this command with N substituted as a decimal:
+
+          node -e 'const n=N,s=`segment-${n}-`; process.stdout.write(s.repeat(Math.ceil(43000/s.length)).slice(0,43000)+`\nCONTEXT_KEY_${n}=orbit-${n*17}\n`)'
+
+        Do not combine the calls and do not redirect output. After observing all six ordinary tool results,
+        close the task with a summary containing every CONTEXT_KEY value in numeric order. This deliberately
+        creates about 258k output characters, approximately 64.5k tokens under Pi's chars/4 estimator.
+  - checkpoint: near-64k-before-projection-check
+  - prompt:
+      text: |-
+        Use list_tasks and inspect_task(summary), without repeating the six bash calls, and report the six
+        CONTEXT_KEY values in numeric order. Also report whether the completed task body is projected on this
+        turn. Do not modify files.
+  - checkpoint: near-64k-after-projection-check

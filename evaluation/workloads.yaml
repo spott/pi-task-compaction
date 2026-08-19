@@ -1,0 +1,53 @@
+schema_version: 1
+summary_arm_meaning: >-
+  summaries=false disables durable retention, not model summary authorship; the normal
+  structured end_task summary is still authored and must not be interpreted as zero
+  summarization effort.
+workloads:
+  - id: roast-solver-primary
+    experiment: experiments/primary.yaml
+    scenario: scenarios/roast-solver.yaml
+    purpose: Six-arm continuity anchor against the v1 Roast Solver experiment.
+    expected_metrics: [task_depth, summary_size, context_projection, worker_usage, total_wall_time, final_quality]
+  - id: roast-solver-diagnostic
+    experiment: experiments/diagnostic.yaml
+    scenario: scenarios/roast-solver.yaml
+    purpose: Named no-op-retention and agent diagnostics.
+    expected_metrics: [summary_size, context_projection, worker_usage, total_wall_time, final_quality]
+  - id: near-64k
+    experiment: experiments/continuity-near-64k.yaml
+    scenario: scenarios/near-64k.yaml
+    purpose: Build approximately 65k Pi-estimated tokens of raw ordinary-tool context before closure.
+    expected_metrics: [raw_projected_context, projection_rejections, total_wall_time]
+    constraint: Does not override the selected provider model's declared context window.
+  - id: preservation-inspection
+    experiment: experiments/continuity-preservation.yaml
+    scenario: scenarios/preservation-inspection.yaml
+    purpose: Force ordinary preservation, bounded inspection, search, and exact output recovery.
+    expected_metrics: [preserved_outputs, inspect_frequency, preserved_output_reads, total_wall_time]
+  - id: parallel-branches
+    experiment: experiments/continuity-parallel.yaml
+    scenario: scenarios/parallel-branches.yaml
+    purpose: Exercise three genuinely independent read-only worker branches and parent overlap.
+    expected_metrics: [worker_startup, worker_overlap, worker_utilization, join_wait, parent_worker_usage]
+  - id: interruption-replay
+    experiment: experiments/continuity-interruption.yaml
+    scenario: scenarios/interruption-replay.yaml
+    purpose: Protect one response, leave one interruption unanswered, then verify replay after closure.
+    expected_metrics: [protected_interactions, replay_frequency, replay_cascade_depth]
+  - id: immutable-pin
+    experiment: experiments/continuity-pin.yaml
+    scenario: scenarios/immutable-pin.yaml
+    purpose: Pin an immutable source result through task projection and global compaction, then recover it.
+    expected_metrics: [pin_count, pin_closure_tokens, preserved_output_reads, global_compaction]
+  - id: worker-derived-failure
+    experiment: experiments/continuity-worker-failure.yaml
+    scenario: scenarios/worker-derived-failure.yaml
+    purpose: Compare normal worker completion with a worker process killed while its semantic task is open.
+    expected_metrics: [worker_failure, derived_failure, join_wait, parent_worker_usage]
+    constraint: Never-started launch failure remains a deterministic unit fixture; cancellation is unsettled in API v2.
+  - id: long-global-compaction
+    experiment: experiments/continuity-long-compaction.yaml
+    scenario: scenarios/long-global-compaction.yaml
+    purpose: Exercise repeated global compaction across completed and open source-audit tasks.
+    expected_metrics: [global_compaction, alignment, cancellation, projection_rejections, total_wall_time]

@@ -1,0 +1,46 @@
+name: task-framework-v2-diagnostic-roast-solver
+scenario: ../scenarios/roast-solver.yaml
+repetitions: 1
+matrix:
+  model:
+    - provider: openai-codex
+      id: gpt-5.6-sol
+      thinking: high
+  configuration:
+    - name: diagnostic-noop-closure-summary
+      extensions: [{source: ../../extensions/task-framework.ts}]
+      extension_flags:
+        task-framework-tasks: true
+        task-framework-summaries: false
+        task-framework-compaction: false
+        task-framework-agents: false
+        task-framework-max-task-depth: 3
+        task-framework-max-agent-depth: 2
+        task-framework-max-concurrent-agents: 4
+    - name: diagnostic-agents-without-summaries
+      extensions: [{source: ../../extensions/task-framework.ts}]
+      extension_flags:
+        task-framework-tasks: true
+        task-framework-summaries: false
+        task-framework-compaction: false
+        task-framework-agents: true
+        task-framework-max-task-depth: 3
+        task-framework-max-agent-depth: 2
+        task-framework-max-concurrent-agents: 4
+    - name: diagnostic-tasks-summaries-agents-compaction-off
+      extensions: [{source: ../../extensions/task-framework.ts}]
+      extension_flags:
+        task-framework-tasks: true
+        task-framework-summaries: true
+        task-framework-compaction: false
+        task-framework-agents: true
+        task-framework-max-task-depth: 3
+        task-framework-max-agent-depth: 2
+        task-framework-max-concurrent-agents: 4
+run:
+  isolation: fast
+  timeout_seconds: 7200
+  max_parallel_per_provider: 1
+  results_dir: ../results
+  pi_executable: ../../node_modules/.bin/pi
+  credential_source: environment

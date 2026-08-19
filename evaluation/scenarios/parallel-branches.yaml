@@ -1,0 +1,19 @@
+name: task-framework-parallel-read-only-branches
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 10
+  - prompt:
+      text: |-
+        This is a read-only worker evaluation; do not modify files. Begin a parent task, then immediately
+        spawn three independent workers: one to audit src/config.ts, one to audit src/projection/planner.ts,
+        and one to audit src/workers/coordinator.ts. Ask each worker for one concrete invariant, one risk,
+        and file/symbol evidence. While they run, continue useful parent work by reading README.md and
+        identifying the public feature promises. Poll sparingly, join all workers only when their results
+        are needed, integrate all three summaries, and close the parent. Report worker task IDs and whether
+        useful parent work overlapped them.
+  - checkpoint: parallel-workers-joined

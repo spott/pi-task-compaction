@@ -1,0 +1,11 @@
+name: roast-solver-m1-through-m6-v2
+repo:
+  source: ../../../roast-solver-seed
+  revision: 9c0173ee9b98ec5fe970f6228fc971cc8b04e29c
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 7200
+  - prompt:
+      file: ../prompts/roast-solver.md
+  - checkpoint: final-agent-state

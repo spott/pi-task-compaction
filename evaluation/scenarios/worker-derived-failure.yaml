@@ -1,0 +1,19 @@
+name: task-framework-worker-derived-failure
+repo:
+  source: ../..
+  revision: 81d2d35
+driver: rpc
+steps:
+  - budget:
+      max_wall_seconds: 1800
+      max_model_turns: 12
+  - prompt:
+      text: |-
+        This is a disposable, read-only worker-lifecycle evaluation. Begin a parent task. Spawn two workers.
+        The normal worker must read src/model/worker.ts, summarize lifecycle states, and close normally.
+        The crash worker's assigned task must instruct it to make this its first ordinary tool action:
+        bash command `kill -KILL "$PPID"`; it must not modify files. That command intentionally terminates
+        only its own Pi worker process while leaving its semantic task open. Continue parent work by reading
+        src/store/run-registry.ts, then join both task IDs with wait=all. Record the normal completion and the
+        crashed worker's registry-derived failure evidence, close the parent, and report all task IDs.
+  - checkpoint: derived-failure-observed
