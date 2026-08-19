@@ -196,7 +196,7 @@ describe("config-gated extension surface", () => {
   });
 
   for (const arm of arms) {
-    it(`registers the exact M7 surface for ${arm.name}`, () => {
+    it(`registers the exact v2 surface for ${arm.name}`, () => {
       const collected = collector();
       registerTaskFramework(collected.pi, config({ ...arm.features }));
       expect([...collected.tools.keys()].sort()).toEqual([...arm.tools].sort());
@@ -234,6 +234,46 @@ describe("config-gated extension surface", () => {
       }
     });
   }
+
+  it("matches the authoritative API v2 parameter names exactly", () => {
+    const collected = collector();
+    registerTaskFramework(
+      collected.pi,
+      config({ tasks: true, summaries: true, compaction: true, agents: true }),
+    );
+    const properties = (name: string): string[] =>
+      Object.keys(collected.tools.get(name).parameters.properties).sort();
+
+    expect(properties("begin_task")).toEqual(["task"]);
+    expect(properties("end_task")).toEqual([
+      "attempted",
+      "decisions",
+      "files_modified",
+      "files_read",
+      "learnings",
+      "objective",
+      "open_threads",
+      "outcome",
+      "preserve_outputs",
+      "task_id",
+      "verification",
+    ]);
+    expect(properties("preserve_output")).toEqual(["pin", "tool_call_id"]);
+    expect(properties("read_preserved_output")).toEqual(["output_id"]);
+    expect(properties("inspect_task")).toEqual([
+      "cursor",
+      "entry",
+      "max_chars",
+      "query",
+      "task_id",
+      "view",
+    ]);
+    expect(properties("list_tasks")).toEqual(["root_task_id", "status"]);
+    expect(properties("respond_to_user")).toEqual([]);
+    expect(properties("spawn_task")).toEqual(["available_context", "required_context", "task"]);
+    expect(properties("poll_task")).toEqual(["task_id"]);
+    expect(properties("join_tasks")).toEqual(["task_ids", "wait"]);
+  });
 });
 
 describe("Pi task extension integration", () => {
