@@ -53,4 +53,21 @@ npm install
 npm run check
 ```
 
+Alternatively, the Nix flake provides Node.js 22, `nixfmt`, and the npm dependency hash tool:
+
+```sh
+nix develop
+npm install
+npm run check
+```
+
+Build the tested Pi-loadable package directory with:
+
+```sh
+nix build
+pi -e ./result
+```
+
+Run all flake checks with `nix flake check`. The flake also exposes `packages.<system>.pi-task-compaction`, `packages.<system>.default`, `overlays.default`, and a default formatter. Package outputs place `package.json` and `extensions/task-framework.ts` directly at the derivation root, matching Pi and the dotfiles flake consumer contract.
+
 The package entrypoint is `extensions/task-framework.ts`.
