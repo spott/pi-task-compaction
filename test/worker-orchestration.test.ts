@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import type { Config } from "../src/config.js";
+import { CONFIG_FLAGS, type Config } from "../src/config.js";
 import { TASK_EVENT_CUSTOM_TYPE, taskEventEnvelope, type TaskEvent } from "../src/model/events.js";
 import type { TaskSummary } from "../src/model/summary.js";
 import { FileRunRegistry } from "../src/store/run-registry.js";
@@ -22,6 +22,7 @@ import { readWorkerTaskSource } from "../src/workers/source.js";
 const config: Config = {
   features: { tasks: true, summaries: true, compaction: false, agents: true },
   limits: { maxTaskDepth: 3, maxAgentDepth: 2, maxConcurrentAgents: 2 },
+  shutdown: { workerDrainMs: 0, workerTermGraceMs: 5_000, workerKillGraceMs: 2_000 },
 };
 
 const summary: TaskSummary = {
@@ -58,7 +59,7 @@ class ControlledLauncher implements WorkerProcessLauncher {
       resolve = done;
     });
     this.exits.push(resolve);
-    return { pid, wait: () => wait, terminate: () => undefined };
+    return { pid, wait: () => wait, terminate: () => true };
   }
 
   finish(index: number, exit: WorkerProcessExit): void {
@@ -84,6 +85,7 @@ async function fixture(overrides: Partial<Config> = {}) {
   const effective: Config = {
     features: { ...config.features, ...overrides.features },
     limits: { ...config.limits, ...overrides.limits },
+    shutdown: { ...config.shutdown, ...overrides.shutdown },
   };
   const runtime = new LocalTaskRuntime(effective);
   const router = new WorkerTaskRouter(registry, parent.getSessionId());
@@ -95,6 +97,7 @@ async function fixture(overrides: Partial<Config> = {}) {
     runtime,
     router,
     launcher,
+    ownerSessionId: parent.getSessionId(),
     extensionPath: join(base, "task-framework.ts"),
     createId: () => ids.shift()!,
     joinPollMs: 2,
@@ -126,6 +129,14 @@ describe("asynchronous worker orchestration", () => {
     const spec = item.launcher.specs[0]!;
     expect(spec.args).toContain("--no-extensions");
     expect(spec.args).toContain("--session");
+    for (const [flag, value] of [
+      [CONFIG_FLAGS.workerShutdownDrainMs, "0"],
+      [CONFIG_FLAGS.workerShutdownTermGraceMs, "5000"],
+      [CONFIG_FLAGS.workerShutdownKillGraceMs, "2000"],
+    ] as const) {
+      const index = spec.args.indexOf(`--${flag}`);
+      expect(spec.args.slice(index, index + 2)).toEqual([`--${flag}`, value]);
+    }
     expect(spec.args.at(-1)).toContain(`Assigned task ID: ${spawned.taskId}`);
     expect(spec.environment.PI_TASK_FRAMEWORK_BOOTSTRAP).toBeTruthy();
     expect((await lstat(spec.environment.PI_TASK_FRAMEWORK_BOOTSTRAP!)).mode & 0o777).toBe(0o600);
@@ -207,6 +218,7 @@ describe("asynchronous worker orchestration", () => {
       runtime: item.runtime,
       router: item.router,
       launcher: new FailingLauncher(),
+      ownerSessionId: item.parent.getSessionId(),
     });
     await expect(coordinator.spawn(
       { task: "cannot launch", requiredContext: [], availableContext: [] },
@@ -323,6 +335,7 @@ describe("asynchronous worker orchestration", () => {
       router: workerRouter,
       bootstrap: workerBootstrap,
       launcher: item.launcher,
+      ownerSessionId: workerRoute.sessionId,
     });
     await expect(nested.spawn(
       { task: "too deep", requiredContext: [], availableContext: [] },
@@ -354,6 +367,7 @@ describe("asynchronous worker orchestration", () => {
       runtime: item.runtime,
       router: item.router,
       launcher,
+      ownerSessionId: item.parent.getSessionId(),
       extensionPath: wrapper,
       createId: () => ids.shift()!,
       joinPollMs: 5,

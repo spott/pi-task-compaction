@@ -26,6 +26,7 @@ describe("task framework config", () => {
       JSON.stringify({
         features: { tasks: true, summaries: true, compaction: false, agents: false },
         limits: { max_task_depth: 7, max_agent_depth: 3, max_concurrent_agents: 8 },
+        shutdown: { worker_drain_ms: 25, worker_term_grace_ms: 6_000, worker_kill_grace_ms: 3_000 },
       }),
     );
 
@@ -35,11 +36,15 @@ describe("task framework config", () => {
         getFlag: flags({
           [CONFIG_FLAGS.summaries]: "false",
           [CONFIG_FLAGS.maxTaskDepth]: "2",
+          [CONFIG_FLAGS.workerShutdownDrainMs]: "0",
+          [CONFIG_FLAGS.workerShutdownTermGraceMs]: "7000",
+          [CONFIG_FLAGS.workerShutdownKillGraceMs]: "4000",
         }),
       }),
     ).toEqual({
       features: { tasks: true, summaries: false, compaction: false, agents: false },
       limits: { maxTaskDepth: 2, maxAgentDepth: 3, maxConcurrentAgents: 8 },
+      shutdown: { workerDrainMs: 0, workerTermGraceMs: 7_000, workerKillGraceMs: 4_000 },
     });
   });
 
@@ -60,5 +65,23 @@ describe("task framework config", () => {
     expect(() => normalizeConfig({ features: { tasks: "yes" } })).toThrow("must be true or false");
     expect(() => normalizeConfig({ limits: { max_task_depth: 0 } })).toThrow("positive integer");
     expect(() => normalizeConfig({ surprise: true })).toThrow("unknown key");
+  });
+
+  it("validates shutdown file and CLI values without coercing invalid durations", () => {
+    expect(normalizeConfig({
+      shutdown: { worker_drain_ms: 0, worker_term_grace_ms: 1, worker_kill_grace_ms: 1 },
+    }).shutdown).toEqual({ workerDrainMs: 0, workerTermGraceMs: 1, workerKillGraceMs: 1 });
+
+    for (const value of [-1, 1.5, "", "later"] as const) {
+      expect(() => resolveConfig({
+        getFlag: flags({ [CONFIG_FLAGS.workerShutdownDrainMs]: String(value) }),
+      })).toThrow("non-negative integer");
+    }
+    for (const flag of [CONFIG_FLAGS.workerShutdownTermGraceMs, CONFIG_FLAGS.workerShutdownKillGraceMs]) {
+      for (const value of [0, -1, 1.5, "", "later"] as const) {
+        expect(() => resolveConfig({ getFlag: flags({ [flag]: String(value) }) })).toThrow("positive integer");
+      }
+    }
+    expect(() => normalizeConfig({ shutdown: { unexpected_ms: 1 } })).toThrow("shutdown contains unknown key");
   });
 });

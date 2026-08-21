@@ -21,6 +21,7 @@ import { precreateWorkerTaskSource, readWorkerTaskSource } from "../src/workers/
 const config: Config = {
   features: { tasks: true, summaries: true, compaction: false, agents: true },
   limits: { maxTaskDepth: 2, maxAgentDepth: 2, maxConcurrentAgents: 2 },
+  shutdown: { workerDrainMs: 0, workerTermGraceMs: 5_000, workerKillGraceMs: 2_000 },
 };
 
 function appendTo(manager: SessionManager) {
@@ -247,7 +248,7 @@ describe("worker routing and single-owner bootstrap", () => {
     const ctx = {
       cwd: item.base,
       sessionManager: activeManager,
-      ui: { setStatus() {} },
+      ui: { setStatus() {}, notify() {} },
     } as unknown as ExtensionContext;
     registerTaskFramework(pi, config, {
       agents: {
@@ -274,7 +275,9 @@ describe("worker routing and single-owner bootstrap", () => {
     expect((await item.registry.resolveWorker(item.workerId))?.status).toBe("running");
     expect(readWorkerTaskSource(item.source.sessionFile, item.taskId).state.startedTaskIds).toContain(item.taskId);
 
-    await handlers.get("session_shutdown")![0]!({ type: "session_shutdown" }, ctx);
+    for (const handler of handlers.get("session_shutdown")!) {
+      await handler({ type: "session_shutdown", reason: "quit" }, ctx);
+    }
     const reopened = readWorkerTaskSource(item.source.sessionFile, item.taskId);
     expect(reopened.task.status).toBe("failed");
     expect((await item.registry.resolveWorker(item.workerId))?.status).toBe("failed");

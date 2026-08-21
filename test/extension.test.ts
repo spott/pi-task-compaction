@@ -53,6 +53,7 @@ function config(features: Config["features"]): Config {
   return {
     features,
     limits: { maxTaskDepth: 3, maxAgentDepth: 2, maxConcurrentAgents: 4 },
+    shutdown: { workerDrainMs: 0, workerTermGraceMs: 5_000, workerKillGraceMs: 2_000 },
   };
 }
 
@@ -197,7 +198,7 @@ describe("config-gated extension surface", () => {
 
     expect(collected.tools.size).toBe(0);
     expect(collected.commands.size).toBe(0);
-    expect(collected.flags).toHaveLength(8);
+    expect(collected.flags).toHaveLength(11);
     const { ctx } = context(manager);
     await collected.handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
     expect(collected.tools.size).toBe(0);

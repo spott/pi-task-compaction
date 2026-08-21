@@ -20,6 +20,7 @@ import { taskFrameworkGuidance } from "./guidance.js";
 import { LocalTaskInspector, type InspectTaskRequest, type InspectTaskResult } from "./inspect/inspect.js";
 import type { TaskId, TaskListItem } from "./model/task.js";
 import type { TaskSummary } from "./model/summary.js";
+import type { WorkerShutdownReport } from "./model/worker.js";
 import type { RunRegistry } from "./store/run-registry.js";
 import type { WorkerBootstrap } from "./workers/bootstrap.js";
 import {
@@ -137,6 +138,15 @@ export interface ProjectionDiagnostics {
   rejectionCounts: Map<string, number>;
 }
 
+export const WORKER_SHUTDOWN_CUSTOM_TYPE = "pi-task-framework/worker-shutdown";
+
+export interface WorkerAgentServices {
+  bootstrap?: WorkerBootstrap;
+  registry: RunRegistry;
+  router: WorkerTaskRouter;
+  coordinator: AsyncWorkerCoordinator;
+}
+
 export interface TaskFrameworkServices {
   runtime: LocalTaskRuntime;
   config: Config;
@@ -144,15 +154,11 @@ export interface TaskFrameworkServices {
   interactions: InteractionService;
   projection: ProjectionDiagnostics;
   inspector: LocalTaskInspector;
-  agents?: {
-    bootstrap?: WorkerBootstrap;
-    registry: RunRegistry;
-    router: WorkerTaskRouter;
-    coordinator: AsyncWorkerCoordinator;
-  };
+  agents: WorkerAgentServices | undefined;
   reconstruct(ctx: ExtensionContext): void;
   ensureLoaded(ctx: ExtensionContext): void;
   startWorker(ctx: ExtensionContext): Promise<void>;
+  startSession(ctx: ExtensionContext): Promise<void>;
 }
 
 export interface RegisterTaskFrameworkOptions {
@@ -164,6 +170,7 @@ export interface RegisterTaskFrameworkOptions {
     bootstrap?: WorkerBootstrap;
     launcher?: WorkerProcessLauncher;
     extensionPath?: string;
+    openRegistry?: (ctx: ExtensionContext) => Promise<RunRegistry>;
   };
 }
 
@@ -358,27 +365,32 @@ export function registerTaskFramework(
   const guidance = taskFrameworkGuidance(config);
   const projection: ProjectionDiagnostics = { rejectionCounts: new Map() };
   const inspector = new LocalTaskInspector(runtime, { projection });
-  const agents = options.agents
-    ? (() => {
-        const router = new WorkerTaskRouter(
-          options.agents.registry,
-          options.agents.localSessionId,
-          options.agents.bootstrap,
-        );
-        const coordinator = new AsyncWorkerCoordinator({
-          config,
-          registry: options.agents.registry,
-          runtime,
-          router,
-          ...(options.agents.bootstrap ? { bootstrap: options.agents.bootstrap } : {}),
-          ...(options.agents.launcher ? { launcher: options.agents.launcher } : {}),
-          ...(options.agents.extensionPath ? { extensionPath: options.agents.extensionPath } : {}),
-        });
-        return { ...options.agents, router, coordinator };
-      })()
+  const agentOptions = options.agents;
+  const createAgentServices = (registry: RunRegistry, localSessionId: string): WorkerAgentServices => {
+    const router = new WorkerTaskRouter(registry, localSessionId, agentOptions?.bootstrap);
+    const coordinator = new AsyncWorkerCoordinator({
+      config,
+      registry,
+      runtime,
+      router,
+      ownerSessionId: localSessionId,
+      ...(agentOptions?.bootstrap ? { bootstrap: agentOptions.bootstrap } : {}),
+      ...(agentOptions?.launcher ? { launcher: agentOptions.launcher } : {}),
+      ...(agentOptions?.extensionPath ? { extensionPath: agentOptions.extensionPath } : {}),
+    });
+    return {
+      registry,
+      router,
+      coordinator,
+      ...(agentOptions?.bootstrap ? { bootstrap: agentOptions.bootstrap } : {}),
+    };
+  };
+  let agents = agentOptions
+    ? createAgentServices(agentOptions.registry, agentOptions.localSessionId)
     : undefined;
   let loadedSessionId: string | undefined;
   let workerStarted = false;
+  const shutdownTelemetryCoordinatorIds = new Set<string>();
 
   const inspectTask = async (
     request: InspectTaskRequest,
@@ -453,16 +465,60 @@ export function registerTaskFramework(
     updateStatus(runtime, ctx);
   };
 
+  const startSession = async (ctx: ExtensionContext): Promise<void> => {
+    reconstruct(ctx);
+    if (agentOptions) {
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (agentOptions.bootstrap) {
+        if (sessionId !== agentOptions.bootstrap.sessionId) {
+          throw new Error("Bootstrapped worker cannot re-arm into another Pi session");
+        }
+        if (!agents) agents = createAgentServices(agentOptions.registry, sessionId);
+      } else if (!agents || agents.coordinator.isClosing || agents.coordinator.ownerSessionId !== sessionId) {
+        const registry = agentOptions.openRegistry
+          ? await agentOptions.openRegistry(ctx)
+          : agentOptions.registry;
+        agents = createAgentServices(registry, sessionId);
+      }
+    }
+    await startWorker(ctx);
+  };
+
   if (options.registerSessionStart !== false) {
     pi.on("session_start", async (_event, ctx) => {
-      reconstruct(ctx);
-      await startWorker(ctx);
+      await startSession(ctx);
     });
   }
-  if (agents?.bootstrap) {
+  if (agentOptions) {
+    pi.on("session_shutdown", async (event, ctx) => {
+      ensureLoaded(ctx);
+      const closingAgents = agents;
+      if (!closingAgents) throw new Error("Agent coordinator is unavailable during session shutdown");
+      if (ctx.sessionManager.getSessionId() !== closingAgents.coordinator.ownerSessionId) {
+        throw new Error("Session shutdown does not match the active worker coordinator owner");
+      }
+      const report = await closingAgents.coordinator.shutdown({
+        reason: event.reason,
+        sessionId: ctx.sessionManager.getSessionId(),
+      });
+      if (!shutdownTelemetryCoordinatorIds.has(report.coordinatorId)) {
+        shutdownTelemetryCoordinatorIds.add(report.coordinatorId);
+        pi.appendEntry(WORKER_SHUTDOWN_CUSTOM_TYPE, report satisfies WorkerShutdownReport);
+      }
+      if (!agentOptions.bootstrap && agents === closingAgents) agents = undefined;
+      if (report.status === "failed") {
+        ctx.ui.notify(
+          `Worker shutdown barrier failed (${report.coordinatorId}); workspace quiescence is unproven`,
+          "error",
+        );
+        throw new Error(`Worker shutdown barrier failed: ${report.coordinatorId}`);
+      }
+    });
+  }
+  if (agentOptions?.bootstrap) {
     pi.on("session_shutdown", async (_event, ctx) => {
       ensureLoaded(ctx);
-      const bootstrap = agents.bootstrap!;
+      const bootstrap = agentOptions.bootstrap!;
       const assigned = runtime.snapshot.tasks.get(bootstrap.taskId);
       if (assigned?.status === "open") {
         runtime.failOpenTasks(
@@ -473,7 +529,7 @@ export function registerTaskFramework(
         );
       }
       const terminal = runtime.snapshot.tasks.get(bootstrap.taskId);
-      await agents.registry.updateWorker(bootstrap.workerId, {
+      await (agents?.registry ?? agentOptions.registry).updateWorker(bootstrap.workerId, {
         status: terminal?.status === "completed" ? "completed" : terminal?.status === "cancelled" ? "cancelled" : "failed",
         exitCode: terminal?.status === "completed" ? 0 : 1,
         exitedAt: Date.now(),
@@ -481,7 +537,7 @@ export function registerTaskFramework(
           ? {}
           : { diagnostics: terminal?.status === "failed" ? "Worker-owned task stream records failure" : "Worker exited without successful task completion" }),
       });
-      await agents.registry.releaseLease(bootstrap.workerId);
+      await (agents?.registry ?? agentOptions.registry).releaseLease(bootstrap.workerId);
     });
   }
   pi.on("session_tree", (_event, ctx) => reconstruct(ctx));
@@ -842,10 +898,13 @@ export function registerTaskFramework(
     interactions,
     projection,
     inspector,
-    ...(agents ? { agents } : {}),
+    get agents() {
+      return agents;
+    },
     reconstruct,
     ensureLoaded,
     startWorker,
+    startSession,
   };
 }
 

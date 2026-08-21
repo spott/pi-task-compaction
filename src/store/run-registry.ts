@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TaskId } from "../model/task.js";
-import type { RunId, WorkerId, WorkerRoute } from "../model/worker.js";
+import type { RunId, WorkerId, WorkerRoute, WorkerShutdownReport } from "../model/worker.js";
 import type { TaskSource } from "../transcript/source.js";
 
 const RUN_SCHEMA_VERSION = 1;
@@ -43,6 +43,10 @@ export interface RunRegistry {
   updateWorker(workerId: WorkerId, patch: Partial<WorkerRoute>): Promise<WorkerRoute>;
   acquireLease(workerId: WorkerId, limit: number): Promise<void>;
   releaseLease(workerId: WorkerId): Promise<void>;
+  listLeaseWorkerIds(): Promise<WorkerId[]>;
+  writeShutdownReport(report: WorkerShutdownReport): Promise<void>;
+  readShutdownReport(coordinatorId: string): Promise<WorkerShutdownReport | undefined>;
+  listShutdownReports(sessionId?: string): Promise<WorkerShutdownReport[]>;
 }
 
 function assertDirectory(metadata: Awaited<ReturnType<typeof lstat>>, path: string): void {
@@ -66,16 +70,22 @@ async function writePrivateJson(path: string, value: unknown, exclusive = false)
   const bytes = `${JSON.stringify(value)}\n`;
   await ensurePrivateDirectory(dirname(path));
   if (exclusive) {
-    const handle = await open(
-      path,
-      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
-      0o600,
-    );
+    const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      handle = await open(
+        temporary,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
       await handle.writeFile(bytes);
       await handle.sync();
-    } finally {
       await handle.close();
+      handle = undefined;
+      await link(temporary, path);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await rm(temporary, { force: true }).catch(() => undefined);
     }
     return;
   }
@@ -93,7 +103,6 @@ async function writePrivateJson(path: string, value: unknown, exclusive = false)
     await handle.close();
     handle = undefined;
     await rename(temporary, path);
-    await chmod(path, 0o600);
   } finally {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
@@ -119,6 +128,7 @@ function validateRoute(value: unknown, runId: RunId): asserts value is WorkerRou
     typeof route.sessionId !== "string" ||
     typeof route.sessionFile !== "string" ||
     typeof route.spawningSessionId !== "string" ||
+    (route.spawningCoordinatorId !== undefined && typeof route.spawningCoordinatorId !== "string") ||
     (route.parentTaskId !== null && typeof route.parentTaskId !== "string") ||
     !["starting", "running", "completed", "failed", "cancelled"].includes(String(route.status))
   ) {
@@ -126,9 +136,59 @@ function validateRoute(value: unknown, runId: RunId): asserts value is WorkerRou
   }
 }
 
+function validateShutdownReport(
+  value: unknown,
+  runId: RunId,
+  coordinatorId?: string,
+): asserts value is WorkerShutdownReport {
+  if (typeof value !== "object" || value === null) throw new Error("Worker shutdown report is not an object");
+  const report = value as Partial<WorkerShutdownReport>;
+  const counts = [
+    report.directWorkerCount,
+    report.naturalExitCount,
+    report.sigtermRequestedCount,
+    report.sigkillRequestedCount,
+    report.monitorFailureCount,
+    report.activeOwnedRouteCount,
+    report.activeDescendantRouteCount,
+    report.activeUnmanagedRouteCount,
+    report.remainingOwnedLeaseCount,
+    report.unsettledSpawnCount,
+    report.survivingHandleCount,
+  ];
+  if (
+    report.schemaVersion !== RUN_SCHEMA_VERSION ||
+    report.runId !== runId ||
+    typeof report.sessionId !== "string" ||
+    report.sessionId === "" ||
+    typeof report.coordinatorId !== "string" ||
+    report.coordinatorId === "" ||
+    (coordinatorId !== undefined && report.coordinatorId !== coordinatorId) ||
+    !["quit", "reload", "new", "resume", "fork"].includes(String(report.reason)) ||
+    typeof report.startedAt !== "number" ||
+    !Number.isFinite(report.startedAt) ||
+    typeof report.endedAt !== "number" ||
+    !Number.isFinite(report.endedAt) ||
+    !["complete", "failed"].includes(String(report.status)) ||
+    counts.some((count) => !Number.isSafeInteger(count) || count! < 0) ||
+    !Array.isArray(report.diagnostics) ||
+    report.diagnostics.some((diagnostic) => typeof diagnostic !== "string" || diagnostic.length > 512) ||
+    report.diagnostics.length > 100
+  ) {
+    throw new Error("Worker shutdown report is malformed or belongs to another run");
+  }
+}
+
 function routeFilename(workerId: WorkerId): string {
   if (!/^[0-9a-f-]+$/iu.test(workerId)) throw new Error("worker ID contains unsafe path characters");
   return `${workerId}.json`;
+}
+
+function shutdownFilename(coordinatorId: string): string {
+  if (!/^[0-9a-z-]+$/iu.test(coordinatorId)) {
+    throw new Error("coordinator ID contains unsafe path characters");
+  }
+  return `${coordinatorId}.json`;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -193,6 +253,7 @@ export class FileRunRegistry implements RunRegistry {
     await ensurePrivateDirectory(directory);
     await ensurePrivateDirectory(join(directory, "workers"));
     await ensurePrivateDirectory(join(directory, "leases"));
+    await ensurePrivateDirectory(join(directory, "shutdowns"));
     const metadataPath = join(directory, "run.json");
     await writePrivateJson(metadataPath, {
       schemaVersion: RUN_SCHEMA_VERSION,
@@ -216,6 +277,7 @@ export class FileRunRegistry implements RunRegistry {
     }
     await ensurePrivateDirectory(join(directory, "workers"));
     await ensurePrivateDirectory(join(directory, "leases"));
+    await ensurePrivateDirectory(join(directory, "shutdowns"));
     return new FileRunRegistry(directory, metadata.runId);
   }
 
@@ -225,6 +287,10 @@ export class FileRunRegistry implements RunRegistry {
 
   private leasePath(workerId: WorkerId): string {
     return join(this.directory, "leases", routeFilename(workerId));
+  }
+
+  private shutdownPath(coordinatorId: string): string {
+    return join(this.directory, "shutdowns", shutdownFilename(coordinatorId));
   }
 
   private async withLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -271,6 +337,7 @@ export class FileRunRegistry implements RunRegistry {
         updated.sessionId !== current.sessionId ||
         updated.sessionFile !== current.sessionFile ||
         updated.spawningSessionId !== current.spawningSessionId ||
+        updated.spawningCoordinatorId !== current.spawningCoordinatorId ||
         updated.parentTaskId !== current.parentTaskId
       ) {
         throw new Error("Immutable worker routing fields cannot be changed");
@@ -334,5 +401,56 @@ export class FileRunRegistry implements RunRegistry {
 
   async releaseLease(workerId: WorkerId): Promise<void> {
     await rm(this.leasePath(workerId), { force: true });
+  }
+
+  async listLeaseWorkerIds(): Promise<WorkerId[]> {
+    const names = (await readdir(join(this.directory, "leases")))
+      .filter((name) => name.endsWith(".json"))
+      .sort();
+    const workerIds: WorkerId[] = [];
+    for (const name of names) {
+      const lease = await readPrivateJson<LeaseRecord>(join(this.directory, "leases", name));
+      if (
+        lease.schemaVersion !== RUN_SCHEMA_VERSION ||
+        typeof lease.workerId !== "string" ||
+        routeFilename(lease.workerId) !== name
+      ) {
+        throw new Error("Worker lease is malformed");
+      }
+      workerIds.push(lease.workerId);
+    }
+    return workerIds;
+  }
+
+  async writeShutdownReport(report: WorkerShutdownReport): Promise<void> {
+    validateShutdownReport(report, this.runId);
+    await writePrivateJson(this.shutdownPath(report.coordinatorId), report, true);
+  }
+
+  async readShutdownReport(coordinatorId: string): Promise<WorkerShutdownReport | undefined> {
+    try {
+      const report = await readPrivateJson<WorkerShutdownReport>(this.shutdownPath(coordinatorId));
+      validateShutdownReport(report, this.runId, coordinatorId);
+      return report;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  async listShutdownReports(sessionId?: string): Promise<WorkerShutdownReport[]> {
+    const names = (await readdir(join(this.directory, "shutdowns")))
+      .filter((name) => name.endsWith(".json"))
+      .sort();
+    const reports: WorkerShutdownReport[] = [];
+    for (const name of names) {
+      const report = await readPrivateJson<WorkerShutdownReport>(join(this.directory, "shutdowns", name));
+      validateShutdownReport(report, this.runId);
+      if (shutdownFilename(report.coordinatorId) !== name) {
+        throw new Error("Worker shutdown report filename does not match its coordinator");
+      }
+      if (sessionId === undefined || report.sessionId === sessionId) reports.push(report);
+    }
+    return reports;
   }
 }

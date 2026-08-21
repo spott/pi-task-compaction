@@ -18,11 +18,11 @@ export interface WorkerProcessExit {
 export interface WorkerProcessHandle {
   pid: number;
   wait(): Promise<WorkerProcessExit>;
-  terminate(signal?: NodeJS.Signals): void;
+  terminate(signal?: NodeJS.Signals): boolean;
 }
 
 export interface WorkerProcessLauncher {
-  launch(spec: WorkerProcessSpec): Promise<WorkerProcessHandle>;
+  launch(spec: WorkerProcessSpec, signal?: AbortSignal): Promise<WorkerProcessHandle>;
 }
 
 export interface WorkerPiInvocation {
@@ -63,7 +63,10 @@ export class NodeWorkerProcessLauncher implements WorkerProcessLauncher {
     this.stderrLimit = options.stderrLimit ?? 32 * 1024;
   }
 
-  async launch(spec: WorkerProcessSpec): Promise<WorkerProcessHandle> {
+  async launch(spec: WorkerProcessSpec, signal?: AbortSignal): Promise<WorkerProcessHandle> {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error("Worker launch was aborted");
+    }
     const child = spawn(
       this.invocation.command,
       [...this.invocation.prefixArgs, ...spec.args],

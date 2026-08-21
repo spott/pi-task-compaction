@@ -14,6 +14,8 @@ With task compaction enabled, completed task bodies are replaced in provider con
 
 Agent mode adds asynchronous `spawn_task`, `poll_task`, and `join_tasks`. A spawn pre-creates a private Pi session with the assigned root's `TaskCreated` event, persists parent/root spawn provenance, and then launches a worker that adopts that source with a fresh local task-depth budget. Required completed summaries and compact available-task references are validated against the worker's visibility grants. Run-wide private lease files enforce concurrency and agent depth; joins return stream-verified summaries or explicit semantic/registry-derived failure evidence without cancelling siblings. `inspect_task`, `list_tasks`, and `read_preserved_output` route across visible worker-owned sessions. Workers share the current working tree, so callers remain responsible for avoiding conflicting edits. API v2 leaves model-visible cancellation unsettled, so no `cancel_task` tool is registered.
 
+Every agent-enabled Pi session owns a distinct worker coordinator and runs an awaited shutdown barrier on `quit`, `reload`, `new`, `resume`, and `fork`. The barrier closes the spawn gate, drains briefly, signals only retained direct-child handles with depth-aware `SIGTERM`/`SIGKILL` escalation, awaits route and lease finalization, and audits the full descendant closure. Nested workers recursively stop their own children before finalizing their assigned root. Each coordinator writes a non-overwriting private shutdown report and appends the same bounded record as `pi-task-framework/worker-shutdown`; a failed report means workspace quiescence is unproven and must block snapshots or authoritative evaluation.
+
 Global Pi compaction now runs the same projection planner used for routine provider context before asking the active Pi model for a structured checkpoint. Pi's requested raw cut point is aligned to task boundaries: completed, protocol-valid projected subtrees can be summarized as summaries/survivors, while open or ambiguous task regions remain wholly on the kept side. This applies to manual, threshold, overflow-retry, and repeated compaction. If an open task already spans the current Pi boundary and no safe prefix remains, compaction cancels rather than cutting through it.
 
 Workflow guidance is generated from the enabled feature set, with every rule prefixed by `[task-compaction-tool]` so these transcript-compaction instructions remain distinct from todo or other task guidance. Core task guidance covers bounded/non-trivial nesting, close-child-before-parent discipline, durable summaries, preservation, and inspection. Compaction guidance alone teaches pin/protection/replay behavior; its pinning rule uses approved plan files and immutable documentation as concrete examples. Agent guidance alone teaches independent shared-tree spawning, worker-local depth reset, useful parent overlap, sparse polling, and result-time joins. Disabled feature guidance is absent from ablation arms.
@@ -38,11 +40,16 @@ The extension reads `.pi/task-framework.json` by default. The full framework is 
     "max_task_depth": 3,
     "max_agent_depth": 2,
     "max_concurrent_agents": 4
+  },
+  "shutdown": {
+    "worker_drain_ms": 0,
+    "worker_term_grace_ms": 5000,
+    "worker_kill_grace_ms": 2000
   }
 }
 ```
 
-CLI overrides use `--task-framework-tasks`, `--task-framework-summaries`, `--task-framework-compaction`, and `--task-framework-agents` with `true` or `false`. `--task-framework-config` selects another JSON file. Invalid dependencies fail at startup: compaction requires tasks and summaries; agents require tasks.
+CLI overrides use `--task-framework-tasks`, `--task-framework-summaries`, `--task-framework-compaction`, and `--task-framework-agents` with `true` or `false`. Worker shutdown durations use `--task-framework-worker-shutdown-drain-ms`, `--task-framework-worker-shutdown-term-grace-ms`, and `--task-framework-worker-shutdown-kill-grace-ms`; nested workers inherit those values exactly. `--task-framework-config` selects another JSON file. Invalid dependencies fail at startup: compaction requires tasks and summaries; agents require tasks.
 
 ## Development
 

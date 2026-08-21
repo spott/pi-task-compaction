@@ -12,35 +12,42 @@ export default function taskFrameworkExtension(pi: ExtensionAPI): void {
   registerConfigFlags(pi);
   const bootstrapPromise = loadWorkerBootstrap();
   let initialized = false;
+  let services: ReturnType<typeof registerTaskFramework>;
   pi.on("session_start", async (_event, ctx) => {
-    if (initialized) return;
-    const bootstrap = await bootstrapPromise;
-    const config = resolveConfig({ cwd: ctx.cwd, getFlag: (name) => pi.getFlag(name) });
-    if (bootstrap && !config.features.agents) {
-      throw new Error("Worker bootstrap requires features.agents=true");
+    if (!initialized) {
+      const bootstrap = await bootstrapPromise;
+      const config = resolveConfig({ cwd: ctx.cwd, getFlag: (name) => pi.getFlag(name) });
+      if (bootstrap && !config.features.agents) {
+        throw new Error("Worker bootstrap requires features.agents=true");
+      }
+      const registry = config.features.agents
+        ? bootstrap
+          ? await FileRunRegistry.open(bootstrap.runDirectory)
+          : await openOrCreateRunRegistry(pi, ctx.sessionManager)
+        : undefined;
+      if (bootstrap && registry?.runId !== bootstrap.runId) {
+        throw new Error(`Worker bootstrap run ${bootstrap.runId} does not match registry ${registry?.runId}`);
+      }
+      services = registerTaskFramework(pi, config, {
+        registerSessionStart: false,
+        ...(registry
+          ? {
+              agents: {
+                registry,
+                localSessionId: ctx.sessionManager.getSessionId(),
+                ...(bootstrap ? { bootstrap } : {}),
+                ...(!bootstrap
+                  ? {
+                      openRegistry: async (destination: typeof ctx) =>
+                        openOrCreateRunRegistry(pi, destination.sessionManager),
+                    }
+                  : {}),
+              },
+            }
+          : {}),
+      });
+      initialized = true;
     }
-    const registry = config.features.agents
-      ? bootstrap
-        ? await FileRunRegistry.open(bootstrap.runDirectory)
-        : await openOrCreateRunRegistry(pi, ctx.sessionManager)
-      : undefined;
-    if (bootstrap && registry?.runId !== bootstrap.runId) {
-      throw new Error(`Worker bootstrap run ${bootstrap.runId} does not match registry ${registry?.runId}`);
-    }
-    const services = registerTaskFramework(pi, config, {
-      registerSessionStart: false,
-      ...(registry
-        ? {
-            agents: {
-              registry,
-              localSessionId: ctx.sessionManager.getSessionId(),
-              ...(bootstrap ? { bootstrap } : {}),
-            },
-          }
-        : {}),
-    });
-    initialized = true;
-    services?.ensureLoaded(ctx);
-    await services?.startWorker(ctx);
+    await services?.startSession(ctx);
   });
 }

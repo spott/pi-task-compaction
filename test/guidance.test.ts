@@ -10,6 +10,7 @@ function config(
   return {
     features: { tasks: true, summaries, compaction, agents },
     limits: { maxTaskDepth: 3, maxAgentDepth: 2, maxConcurrentAgents: 4 },
+    shutdown: { workerDrainMs: 0, workerTermGraceMs: 5_000, workerKillGraceMs: 2_000 },
   };
 }
 

@@ -1,5 +1,36 @@
 export type WorkerId = string;
 export type RunId = string;
+export type WorkerCoordinatorId = string;
+
+export type WorkerShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
+
+export interface WorkerShutdownRequest {
+  reason: WorkerShutdownReason;
+  sessionId: string;
+}
+
+export interface WorkerShutdownReport {
+  schemaVersion: 1;
+  runId: RunId;
+  sessionId: string;
+  coordinatorId: WorkerCoordinatorId;
+  reason: WorkerShutdownReason;
+  startedAt: number;
+  endedAt: number;
+  status: "complete" | "failed";
+  directWorkerCount: number;
+  naturalExitCount: number;
+  sigtermRequestedCount: number;
+  sigkillRequestedCount: number;
+  monitorFailureCount: number;
+  activeOwnedRouteCount: number;
+  activeDescendantRouteCount: number;
+  activeUnmanagedRouteCount: number;
+  remainingOwnedLeaseCount: number;
+  unsettledSpawnCount: number;
+  survivingHandleCount: number;
+  diagnostics: string[];
+}
 
 export interface LocalTaskExecution {
   kind: "local";
@@ -32,6 +63,7 @@ export interface WorkerRoute {
   sessionId: string;
   sessionFile: string;
   spawningSessionId: string;
+  spawningCoordinatorId?: WorkerCoordinatorId;
   parentTaskId: string | null;
   pid?: number;
   status: WorkerLifecycleStatus;

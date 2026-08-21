@@ -8,6 +8,7 @@ import type { TaskEventLog } from "../src/store/task-events.js";
 const config: Config = {
   features: { tasks: true, summaries: true, compaction: false, agents: false },
   limits: { maxTaskDepth: 3, maxAgentDepth: 2, maxConcurrentAgents: 4 },
+  shutdown: { workerDrainMs: 0, workerTermGraceMs: 5_000, workerKillGraceMs: 2_000 },
 };
 
 const ids = [
